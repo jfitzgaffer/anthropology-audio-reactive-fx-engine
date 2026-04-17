@@ -1,0 +1,13 @@
+# Environments
+.venv/
+venv/
+env/
+
+# Mac OS
+.DS_Store
+
+# PyCharm Data
+.idea/
+
+# Logs
+*.log
