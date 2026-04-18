@@ -538,8 +538,7 @@ def cleanup_pd():
     if sys.platform == "win32":
         os.system("taskkill /F /IM pd.exe 2>nul")
     else:
-        os.system("killall -9 pd 2>/dev/null")
-        os.system("killall -9 Pd 2>/dev/null")
+        os.system("pkill -9 -f audio_input.pd 2>/dev/null")
     logger.info("Shutdown complete. See you next time!")
     os._exit(0)  # <--- THIS IS CRITICAL
 
@@ -559,8 +558,7 @@ if __name__ == "__main__":
     if sys.platform == "win32":
         os.system("taskkill /F /IM pd.exe 2>nul")
     else:
-        os.system("killall -9 pd 2>/dev/null")
-        os.system("killall -9 Pd 2>/dev/null")
+        os.system("pkill -9 -f audio_input.pd 2>/dev/null")
 
     time.sleep(0.5)
 
