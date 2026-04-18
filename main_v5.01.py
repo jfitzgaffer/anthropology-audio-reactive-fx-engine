@@ -126,6 +126,9 @@ params = {
     "mute": 0,
     # Persisted Pure Data audio input device ID. None = PD default.
     "pd_audio_dev": None,
+    # Persisted Pure Data audio output device ID. Needed for BlackHole-input
+    # rigs so PD doesn't accidentally output back into the loopback.
+    "pd_audio_dev_out": None,
 }
 
 params["num_fixtures"] = 1
@@ -206,6 +209,11 @@ app_state = {
     # Tracks (offset, universe) pairs we've already warned about so the
     # offset-collision log doesn't spam every audio frame.
     "offset_warned": set(),
+    # Panic Blackout flag. Toggled by the GUI's PANIC BLACKOUT button.
+    # When True, sender_thread overwrites every outgoing payload with zeros
+    # so fixtures actively go dark — we can't just halt transmission because
+    # most DMX consoles hold their last frame when the packet stream stops.
+    "panic_blackout": False,
 }
 
 engine = RenderEngine()
@@ -336,6 +344,16 @@ def handle_audio(unused_addr, total_db, bass_db, treble_db):
 
     buffers = engine.process_audio(total_db, bass_db, treble_db, params)
 
+    # Panic Blackout: zero the engine's published buffers in-place so BOTH
+    # the GUI's DMX grid preview (which reads engine.get_snapshot()) and
+    # the network sender (which reuses this same dict reference) see the
+    # blackout. We don't halt transmission — consoles would hold the last
+    # rendered frame; we actively blast zeros so fixtures go dark.
+    if app_state.get("panic_blackout"):
+        zero = bytes(512)
+        for u in buffers:
+            buffers[u] = zero
+
     if time.time() - app_state["packet_reset_time"] > 60.0:
         app_state["art_packets"] = 0
         app_state["packet_reset_time"] = time.time()
@@ -401,6 +419,12 @@ def handle_audio(unused_addr, total_db, bass_db, treble_db):
                 fb_payload[base_ch + 12] = int(params.get(f"f{fix_num}_bg_w", params.get("bg_w", 0.0)))
 
         fb_payload[510] = 0  # (Previously Base Mix)
+
+        # Panic Blackout also flattens the fallback universe (U14), which
+        # carries the control/master layer. Done here rather than skipping
+        # the build above so one flag covers every outgoing channel.
+        if app_state.get("panic_blackout"):
+            fb_payload = [0] * 512
 
         job = {"buffers": buffers, "fb_payload": fb_payload, "cfg": cfg}
         try:
@@ -564,9 +588,30 @@ def artnet_listener_thread():
             sock.close()
 
 
+PD_INIT_PARAMS = ["hip", "lop", "env", "test_freq", "test_db",
+                  "test_on", "sweep_on", "input_trim", "mute"]
+
+
 def notify_pd(name, val):
-    if name in ["hip", "lop", "env", "test_on", "test_freq", "test_db", "sweep_on", "input_trim", "mute"]:
+    if name in PD_INIT_PARAMS:
         pd_client.send_message(f"/{name}", float(val))
+
+
+def push_pd_init_params():
+    """Re-send every PD-relevant parameter in the current `params` dict.
+
+    PD's filter/oscillator/mute state resets whenever the Watchdog relaunches
+    the engine (boot, audio device change, crash recovery). Without this push,
+    the new PD process runs with patch-hardcoded defaults and the user's
+    current GUI state diverges silently from what PD is actually doing — the
+    symptom is "test tone plays nothing", "mute does nothing", or "switching
+    input device kills audio until I wiggle a control".
+    """
+    for p in PD_INIT_PARAMS:
+        try:
+            pd_client.send_message(f"/{p}", float(params.get(p, 0)))
+        except Exception as e:
+            logger.warning(f"push_pd_init_params: failed to send /{p}: {e}")
 
 
 def toggle_artnet():
@@ -617,12 +662,16 @@ if __name__ == "__main__":
     # ever appears. If the user previously selected a specific audio input
     # device, pass that device_id in so the engine boots on the right hardware.
     watchdog = TitanWatchdog(pd_patch_name=os.path.join(BASE_DIR, "audio_input.pd"))
-    saved_dev = params.get("pd_audio_dev")
-    try:
-        saved_dev_int = int(saved_dev) if saved_dev is not None else None
-    except (TypeError, ValueError):
-        saved_dev_int = None
-    watchdog.start_engine(device_id=saved_dev_int)
+
+    def _coerce_dev_id(v):
+        try:
+            return int(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    saved_dev_int = _coerce_dev_id(params.get("pd_audio_dev"))
+    saved_dev_out_int = _coerce_dev_id(params.get("pd_audio_dev_out"))
+    watchdog.start_engine(device_id=saved_dev_int, output_device_id=saved_dev_out_int)
 
     disp = dispatcher.Dispatcher()
     disp.map("/audio/bands", handle_audio)
@@ -665,10 +714,16 @@ if __name__ == "__main__":
         # The GUI's Audio tab uses this to populate the device dropdown and
         # to relaunch PD when the user picks a different interface.
         "watchdog": watchdog,
+        # Called after any PD relaunch (device change) to re-sync filter,
+        # oscillator, and mute state from `params` into the fresh PD process.
+        "push_pd_init": push_pd_init_params,
     }
     gui = TitanQtGUI(params, slider_cfg, engine, app_state, callbacks)
 
-    for p in ["hip", "lop", "env", "test_freq", "test_db", "test_on", "sweep_on", "input_trim", "mute"]:
-        pd_client.send_message(f"/{p}", float(params.get(p, 0)))
+    # Push init params shortly after launch so PD has opened its OSC listener
+    # by the time the messages arrive (PD's own loadbang + `delay 500` enables
+    # DSP ~500 ms after the patch loads; we wait a bit longer to be safe).
+    from PySide6.QtCore import QTimer
+    QTimer.singleShot(1500, push_pd_init_params)
 
     sys.exit(app.exec())
