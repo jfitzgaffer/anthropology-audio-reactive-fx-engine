@@ -79,17 +79,9 @@ Lighting console ──Art-Net→ UDP 6454 ──→ artnet_listener_thread ─�
 
 ### CRITICAL — fix first
 
-1. **GUI instantiated twice.** `main_v5.01.py` lines 574–577. Two full `TitanQtGUI` objects are built on boot; the first is orphaned but has already installed a log handler and started a 33 ms QTimer. Delete the duplicate block (lines 576–577).
-
-2. **Force-On and Force-Off checkboxes can both be checked.** All three effect pairs (`master_ana_force_on` / `..._off`, `master_digi_force_on` / `..._off`, `master_od_force_on` / `..._off`) have no mutual exclusion in the UI. Engine resolves "off wins", but the logically impossible state is reachable. Make each pair mutually exclusive in the checkbox handlers.
-
 3. **`artnet_offset=1` collapses universe 0 and universe 1 to the same output.** `main_v5.01.py` line 264: `out_u = max(0, u - offset)`. If a user patches both U0 and U1, they both clamp to out_u=0. Either reject U0 in the patch UI when the offset is enabled, or surface a warning.
 
-4. **Scope goes blank when fixture #1 is inactive.** `titan_engine.py` line 329 gates scope updates on `f_idx == 0`. If that fixture is skipped via `continue` at line 128, center/edge curves freeze. Track "first active fixture" and update scopes there.
-
 5. **Remote-Control status lies when remote is locked.** `main_v5.01.py` `process_control_universe` writes `app_state["last_ctrl_time"] = time.time()` before checking the GUI lock. When remote is disabled the status can still display "🟢 RX (DMX)". Only update `last_ctrl_time` after the remote-enabled + lock-time guards pass.
-
-6. **Mojibake status icons.** `main_v5.01.py` lines 221–229 contain garbled CJK glyphs where emojis should be (`閥 WAIT`, `笞ｫ IGNORED`, `泙 RX`). Replace with intended emojis (likely ⏳ / ⚫ / 🟢).
 
 ### HIGH
 
@@ -151,12 +143,10 @@ Lighting console ──Art-Net→ UDP 6454 ──→ artnet_listener_thread ─�
 
 ## Feature backlog (prioritized for a non-technical operator)
 
-- **Blackout / panic key.** Spacebar zeros all output. Single biggest safety feature.
 - **Simple Mode vs Pro Mode.** Hide 80 % of sliders behind a toggle. Simple shows: Input, Floor (sensitivity), Color, Brightness, Speed, Response Style preset.
 - **Auto-calibrate levels.** 20 s of audio → auto-set floor at 20th percentile, ceiling at 95th.
 - **Input headroom meter** with green/yellow/red zones next to Input Trim.
-- **Confirm-before-quit** when Art-Net is transmitting.
-- **Autosave every 60 s** to `titan_autosave.json` + restore prompt on next launch.
+- **Autosave restore prompt on next launch.** Write path is done (`titan_autosave.json` via 60 s `QTimer`); still need a startup check that offers to load the autosave if newer than the saved patch.
 - **Preset thumbnails + friendly names** (add `description` field to preset JSON; small scope-shape PNG optional).
 - **Keyboard shortcuts:** Space = mute, B = blackout, T = test tone, 1–9 = preset slot.
 - **Virtual fixture preview strip** (extension of the existing DMX grid).
