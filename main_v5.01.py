@@ -228,6 +228,7 @@ except OSError as e:
 pd_client = udp_client.SimpleUDPClient("127.0.0.1", 5006)
 
 send_queue = queue.Queue(maxsize=1)
+audio_queue = queue.Queue(maxsize=1)
 
 
 def _build_artnet_packet(universe, payload, art_net_val, art_sub_val):
@@ -327,122 +328,138 @@ def sender_thread():
 
 
 def handle_audio(unused_addr, total_db, bass_db, treble_db):
-    app_state["pd_last_time"] = time.time()
-
-    app_state["audio_frame_count"] += 1
+    """OSC receive callback — stays minimal so the UDP socket never backs up."""
     now = time.time()
+    app_state["pd_last_time"] = now
+    app_state["audio_frame_count"] += 1
     if now - app_state["last_fps_time"] >= 1.0:
         app_state["current_fps"] = app_state["audio_frame_count"] / (now - app_state["last_fps_time"])
         app_state["audio_frame_count"] = 0
         app_state["last_fps_time"] = now
 
-    if now - app_state.get("preset_text_time", 0) < 3.0:
-        pass
-    elif now - app_state.get("last_ctrl_time", 0) < 3.5:
-        # We are actively receiving DMX! Are we listening or ignoring?
-        if int(params.get("remote_on", 1)) == 0:
-            app_state["osc_in_text"] = "⚫ IGNORED (Lock ON)"
-        else:
-            app_state["osc_in_text"] = "🟢 RX (DMX)"
-    else:
-        app_state["osc_in_text"] = "🔴 WAIT"
-
-    buffers = engine.process_audio(total_db, bass_db, treble_db, params)
-
-    # Panic Blackout: zero the engine's published buffers in-place so BOTH
-    # the GUI's DMX grid preview (which reads engine.get_snapshot()) and
-    # the network sender (which reuses this same dict reference) see the
-    # blackout. We don't halt transmission — consoles would hold the last
-    # rendered frame; we actively blast zeros so fixtures go dark.
-    if app_state.get("panic_blackout"):
-        zero = bytes(512)
-        for u in buffers:
-            buffers[u] = zero
-
-    if time.time() - app_state["packet_reset_time"] > 60.0:
-        app_state["art_packets"] = 0
-        app_state["packet_reset_time"] = time.time()
-
-    if app_state["artnet_active"]:
-        protocol = params.get("protocol", "Art-Net")
-        is_sacn = protocol == "sACN"
-        cfg = {
-            "is_sacn": is_sacn,
-            "net_mode": params.get("net_mode", "Unicast"),
-            "base_ip": str(params.get("art_ip", "127.0.0.1")).strip(),
-            "target_port": 5568 if is_sacn else int(params.get("art_port", 6454)),
-            "priority": int(params.get("sacn_priority", 100)),
-            "src_name": str(params.get("sacn_src", "Titan Engine")),
-            "is_preview": int(params.get("sacn_preview", 0)) == 1,
-            "art_net_val": int(params.get("art_net", 0)),
-            "art_sub_val": int(params.get("art_sub", 0)),
-            "offset": 1 if int(params.get("artnet_offset", 1)) == 1 else 0,
-        }
-
-        fb_payload = [0] * 512
-        fb_payload[0] = int(float(params.get("master_inhibitive", 1.0)) * 255)
-        fb_payload[1] = int(params.get("color_r", 255.0))
-        fb_payload[2] = int(params.get("color_g", 255.0))
-        fb_payload[3] = int(params.get("color_b", 255.0))
-        fb_payload[4] = int(params.get("color_w", 0.0))
-
-        fb_payload[5] = 255 if int(params.get("master_ana_force_on", 0)) else 0
-        fb_payload[6] = 255 if int(params.get("master_digi_force_on", 0)) else 0
-        fb_payload[7] = 255 if int(params.get("master_od_force_on", 0)) else 0
-
-        fb_payload[8] = int(((params.get("skew", 0.0) + 1.0) / 2.0) * 255.0)
-        fb_payload[9] = int(params.get("width", 1.0) * 255.0)
-        fb_payload[10] = int(params.get("glitch_ana_amt", 0.0) * 255.0)
-        fb_payload[11] = int(params.get("glitch_digi_amt", 0.0) * 255.0)
-        fb_payload[12] = int(params.get("od_glitch", 0.0) * 255.0)
-
-        fb_payload[13] = int(float(params.get("bg_dimmer", 1.0)) * 255)
-        fb_payload[14] = int(params.get("bg_r", 0.0))
-        fb_payload[15] = int(params.get("bg_g", 0.0))
-        fb_payload[16] = int(params.get("bg_b", 0.0))
-        fb_payload[17] = int(params.get("bg_w", 0.0))
-
-        num_fixes = int(params.get("num_fixtures", 1))
-        for f_idx in range(num_fixes):
-            base_ch = 18 + (f_idx * 13)
-            if base_ch + 12 < 512:
-                fix_num = f_idx + 1
-                fb_payload[base_ch + 0] = int(float(params.get(f"f{fix_num}_dimmer", 1.0)) * 255)
-                fb_payload[base_ch + 1] = int(params.get(f"f{fix_num}_color_r", params.get("color_r", 255.0)))
-                fb_payload[base_ch + 2] = int(params.get(f"f{fix_num}_color_g", params.get("color_g", 255.0)))
-                fb_payload[base_ch + 3] = int(params.get(f"f{fix_num}_color_b", params.get("color_b", 255.0)))
-                fb_payload[base_ch + 4] = int(params.get(f"f{fix_num}_color_w", params.get("color_w", 0.0)))
-                fb_payload[base_ch + 5] = 255 if int(params.get(f"f{fix_num}_glitch_ana", 0)) else 0
-                fb_payload[base_ch + 6] = 255 if int(params.get(f"f{fix_num}_glitch_digi", 0)) else 0
-                fb_payload[base_ch + 7] = 255 if int(params.get(f"f{fix_num}_od_en", 0)) else 0
-
-                fb_payload[base_ch + 8] = int(
-                    float(params.get(f"f{fix_num}_bg_dimmer", params.get("bg_dimmer", 1.0))) * 255)
-                fb_payload[base_ch + 9] = int(params.get(f"f{fix_num}_bg_r", params.get("bg_r", 0.0)))
-                fb_payload[base_ch + 10] = int(params.get(f"f{fix_num}_bg_g", params.get("bg_g", 0.0)))
-                fb_payload[base_ch + 11] = int(params.get(f"f{fix_num}_bg_b", params.get("bg_b", 0.0)))
-                fb_payload[base_ch + 12] = int(params.get(f"f{fix_num}_bg_w", params.get("bg_w", 0.0)))
-
-        fb_payload[510] = 0  # (Previously Base Mix)
-
-        # Panic Blackout also flattens the fallback universe (U14), which
-        # carries the control/master layer. Done here rather than skipping
-        # the build above so one flag covers every outgoing channel.
-        if app_state.get("panic_blackout"):
-            fb_payload = [0] * 512
-
-        job = {"buffers": buffers, "fb_payload": fb_payload, "cfg": cfg}
+    try:
+        audio_queue.put_nowait((total_db, bass_db, treble_db))
+    except queue.Full:
         try:
-            send_queue.put_nowait(job)
+            audio_queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            audio_queue.put_nowait((total_db, bass_db, treble_db))
         except queue.Full:
-            try:
-                send_queue.get_nowait()
-            except queue.Empty:
+            pass
+
+
+def compute_audio_thread():
+    """Drains audio_queue, runs DSP, builds the send job, queues it for the sender."""
+    while True:
+        try:
+            total_db, bass_db, treble_db = audio_queue.get()
+
+            now = time.time()
+            if now - app_state.get("preset_text_time", 0) < 3.0:
                 pass
+            elif now - app_state.get("last_ctrl_time", 0) < 3.5:
+                if int(params.get("remote_on", 1)) == 0:
+                    app_state["osc_in_text"] = "⚫ IGNORED (Lock ON)"
+                else:
+                    app_state["osc_in_text"] = "🟢 RX (DMX)"
+            else:
+                app_state["osc_in_text"] = "🔴 WAIT"
+
+            buffers = engine.process_audio(total_db, bass_db, treble_db, params)
+
+            if app_state.get("panic_blackout"):
+                zero = bytes(512)
+                for u in buffers:
+                    buffers[u] = zero
+
+            if now - app_state["packet_reset_time"] > 60.0:
+                app_state["art_packets"] = 0
+                app_state["packet_reset_time"] = now
+
+            if not app_state["artnet_active"]:
+                continue
+
+            protocol = params.get("protocol", "Art-Net")
+            is_sacn = protocol == "sACN"
+            cfg = {
+                "is_sacn": is_sacn,
+                "net_mode": params.get("net_mode", "Unicast"),
+                "base_ip": str(params.get("art_ip", "127.0.0.1")).strip(),
+                "target_port": 5568 if is_sacn else int(params.get("art_port", 6454)),
+                "priority": int(params.get("sacn_priority", 100)),
+                "src_name": str(params.get("sacn_src", "Titan Engine")),
+                "is_preview": int(params.get("sacn_preview", 0)) == 1,
+                "art_net_val": int(params.get("art_net", 0)),
+                "art_sub_val": int(params.get("art_sub", 0)),
+                "offset": 1 if int(params.get("artnet_offset", 1)) == 1 else 0,
+            }
+
+            fb_payload = [0] * 512
+            fb_payload[0] = int(float(params.get("master_inhibitive", 1.0)) * 255)
+            fb_payload[1] = int(params.get("color_r", 255.0))
+            fb_payload[2] = int(params.get("color_g", 255.0))
+            fb_payload[3] = int(params.get("color_b", 255.0))
+            fb_payload[4] = int(params.get("color_w", 0.0))
+
+            fb_payload[5] = 255 if int(params.get("master_ana_force_on", 0)) else 0
+            fb_payload[6] = 255 if int(params.get("master_digi_force_on", 0)) else 0
+            fb_payload[7] = 255 if int(params.get("master_od_force_on", 0)) else 0
+
+            fb_payload[8] = int(((params.get("skew", 0.0) + 1.0) / 2.0) * 255.0)
+            fb_payload[9] = int(params.get("width", 1.0) * 255.0)
+            fb_payload[10] = int(params.get("glitch_ana_amt", 0.0) * 255.0)
+            fb_payload[11] = int(params.get("glitch_digi_amt", 0.0) * 255.0)
+            fb_payload[12] = int(params.get("od_glitch", 0.0) * 255.0)
+
+            fb_payload[13] = int(float(params.get("bg_dimmer", 1.0)) * 255)
+            fb_payload[14] = int(params.get("bg_r", 0.0))
+            fb_payload[15] = int(params.get("bg_g", 0.0))
+            fb_payload[16] = int(params.get("bg_b", 0.0))
+            fb_payload[17] = int(params.get("bg_w", 0.0))
+
+            num_fixes = int(params.get("num_fixtures", 1))
+            for f_idx in range(num_fixes):
+                base_ch = 18 + (f_idx * 13)
+                if base_ch + 12 < 512:
+                    fix_num = f_idx + 1
+                    fb_payload[base_ch + 0] = int(float(params.get(f"f{fix_num}_dimmer", 1.0)) * 255)
+                    fb_payload[base_ch + 1] = int(params.get(f"f{fix_num}_color_r", params.get("color_r", 255.0)))
+                    fb_payload[base_ch + 2] = int(params.get(f"f{fix_num}_color_g", params.get("color_g", 255.0)))
+                    fb_payload[base_ch + 3] = int(params.get(f"f{fix_num}_color_b", params.get("color_b", 255.0)))
+                    fb_payload[base_ch + 4] = int(params.get(f"f{fix_num}_color_w", params.get("color_w", 0.0)))
+                    fb_payload[base_ch + 5] = 255 if int(params.get(f"f{fix_num}_glitch_ana", 0)) else 0
+                    fb_payload[base_ch + 6] = 255 if int(params.get(f"f{fix_num}_glitch_digi", 0)) else 0
+                    fb_payload[base_ch + 7] = 255 if int(params.get(f"f{fix_num}_od_en", 0)) else 0
+
+                    fb_payload[base_ch + 8] = int(
+                        float(params.get(f"f{fix_num}_bg_dimmer", params.get("bg_dimmer", 1.0))) * 255)
+                    fb_payload[base_ch + 9] = int(params.get(f"f{fix_num}_bg_r", params.get("bg_r", 0.0)))
+                    fb_payload[base_ch + 10] = int(params.get(f"f{fix_num}_bg_g", params.get("bg_g", 0.0)))
+                    fb_payload[base_ch + 11] = int(params.get(f"f{fix_num}_bg_b", params.get("bg_b", 0.0)))
+                    fb_payload[base_ch + 12] = int(params.get(f"f{fix_num}_bg_w", params.get("bg_w", 0.0)))
+
+            fb_payload[510] = 0  # (Previously Base Mix)
+
+            if app_state.get("panic_blackout"):
+                fb_payload = [0] * 512
+
+            job = {"buffers": buffers, "fb_payload": fb_payload, "cfg": cfg}
             try:
                 send_queue.put_nowait(job)
             except queue.Full:
-                pass
+                try:
+                    send_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    send_queue.put_nowait(job)
+                except queue.Full:
+                    pass
+
+        except Exception:
+            logger.exception("compute_audio_thread error")
 
 
 def get_preset_slot(val):
@@ -704,6 +721,9 @@ if __name__ == "__main__":
 
     audio_thread = threading.Thread(target=run_osc_server, daemon=True)
     audio_thread.start()
+
+    compute_thread = threading.Thread(target=compute_audio_thread, daemon=True, name="AudioCompute")
+    compute_thread.start()
 
     artnet_ctrl_thread = threading.Thread(target=artnet_listener_thread, daemon=True)
     artnet_ctrl_thread.start()

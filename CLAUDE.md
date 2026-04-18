@@ -79,9 +79,7 @@ Lighting console ──Art-Net→ UDP 6454 ──→ artnet_listener_thread ─�
 
 ### HIGH
 
-8. **Thread-safety: none.** `handle_audio` on the OSC thread writes `engine.dmx_buffers` and `engine.scope_*` while the Qt thread reads them at 30 Hz in `refresh_logic`. GIL keeps it mostly OK but `deque`→`list(…)` can observe a half-updated deque. Add a `threading.Lock` around the buffer swap, or double-buffer.
-
-9. **Audio processing runs on the OSC receive thread.** All DSP + all network sends happen inside `handle_audio`. Any `sendto()` stall blocks audio intake. Move network output to its own thread with a single-slot queue (latest frame wins).
+8. **Thread-safety: partial.** `compute_audio_thread` writes `engine.dmx_buffers` and `engine.scope_*` deques; the Qt thread reads a snapshot at 30 Hz via `engine.get_snapshot()`. The `buf_lock` guards the published snapshot, but `scope_audio.append()` happens outside the lock before `list(scope_audio)` inside it. CPython's GIL makes this safe in practice but it's technically a data race. Moving the three `scope_*.append()` calls inside the `with buf_lock:` block in `titan_engine.py` would close it properly.
 
 10. **Hard-coded 44.1 kHz assumption.** `titan_engine.py` line 83 uses `env / 44100.0`. macOS default is 48 kHz → timings are ~8% off. Force PD sample rate with `-r 44100` on launch, or read the actual rate.
 

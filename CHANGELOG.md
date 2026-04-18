@@ -5,6 +5,34 @@ All notable changes to Titan Engine are documented here. Format follows
 
 ## [Unreleased]
 
+### [2026-04-18] - Decouple DSP from OSC receive thread (compute_audio_thread)
+
+#### Changed
+- **`handle_audio` is now a minimal OSC receive stub.** It updates
+  FPS counters and `pd_last_time`, then puts the raw
+  `(total_db, bass_db, treble_db)` tuple onto a new `audio_queue`
+  (maxsize=1, latest-frame-wins) and returns. Previously it ran
+  `engine.process_audio()`, built a 90-line `fb_payload`, and
+  constructed the `cfg` dict synchronously — blocking the UDP socket
+  while DSP ran. Under CPU load (thermal throttle, GC, anything else
+  on the machine) that could fill the OS UDP receive buffer and drop
+  audio frames silently.
+- **New `compute_audio_thread` daemon thread** drains `audio_queue` and
+  does all the work that `handle_audio` used to do: `osc_in_text`
+  status, `engine.process_audio()`, panic blackout, packet-reset
+  counter, `cfg`/`fb_payload` construction, and `send_queue.put_nowait`.
+  Wrapped in `except Exception: logger.exception(...)` so a DSP crash
+  doesn't take down the whole engine.
+- **Thread topology** is now:
+  `OSC recv → audio_queue → AudioCompute → send_queue → DMXSender`
+  The Art-Net/DMX control listener and Qt GUI thread are unchanged.
+- **`CLAUDE.md` Known Bugs #9** removed (audio processing on OSC recv
+  thread). **#8** updated: the GIL-guarded scope deque race is still
+  technically open; moving the three `scope_*.append()` calls inside
+  the `buf_lock` block in `titan_engine.py` would close it.
+
+---
+
 ### [2026-04-18] - Deduplicate preset whitelist, packet send, and PD RMS envelope
 
 #### Changed
