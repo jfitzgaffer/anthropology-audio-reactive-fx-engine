@@ -564,30 +564,9 @@ def artnet_listener_thread():
             sock.close()
 
 
-PD_INIT_PARAMS = ["hip", "lop", "env", "test_freq", "test_db",
-                  "test_on", "sweep_on", "input_trim", "mute"]
-
-
 def notify_pd(name, val):
-    if name in PD_INIT_PARAMS:
+    if name in ["hip", "lop", "env", "test_on", "test_freq", "test_db", "sweep_on", "input_trim", "mute"]:
         pd_client.send_message(f"/{name}", float(val))
-
-
-def push_pd_init_params():
-    """Re-send every PD-relevant parameter in the current `params` dict.
-
-    PD's filter/oscillator/mute state resets whenever the Watchdog relaunches
-    the engine (boot, audio device change, crash recovery). Without this push,
-    the new PD process runs with patch-hardcoded defaults and the user's
-    current GUI state diverges silently from what PD is actually doing — the
-    symptom is "test tone plays nothing", "mute does nothing", or "switching
-    input device kills audio until I wiggle a control".
-    """
-    for p in PD_INIT_PARAMS:
-        try:
-            pd_client.send_message(f"/{p}", float(params.get(p, 0)))
-        except Exception as e:
-            logger.warning(f"push_pd_init_params: failed to send /{p}: {e}")
 
 
 def toggle_artnet():
@@ -686,16 +665,10 @@ if __name__ == "__main__":
         # The GUI's Audio tab uses this to populate the device dropdown and
         # to relaunch PD when the user picks a different interface.
         "watchdog": watchdog,
-        # Called after any PD relaunch (device change) to re-sync filter,
-        # oscillator, and mute state from `params` into the fresh PD process.
-        "push_pd_init": push_pd_init_params,
     }
     gui = TitanQtGUI(params, slider_cfg, engine, app_state, callbacks)
 
-    # Push init params shortly after launch so PD has opened its OSC listener
-    # by the time the messages arrive (PD's own loadbang + `delay 500` enables
-    # DSP ~500 ms after the patch loads; we wait a bit longer to be safe).
-    from PySide6.QtCore import QTimer
-    QTimer.singleShot(1500, push_pd_init_params)
+    for p in ["hip", "lop", "env", "test_freq", "test_db", "test_on", "sweep_on", "input_trim", "mute"]:
+        pd_client.send_message(f"/{p}", float(params.get(p, 0)))
 
     sys.exit(app.exec())

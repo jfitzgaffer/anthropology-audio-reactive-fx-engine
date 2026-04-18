@@ -247,15 +247,6 @@ class TitanQtGUI(QObject):
             logger.info(f"Pure Data restarted with audio device_id={dev_id}.")
         except Exception as e:
             logger.error(f"Failed to restart Pure Data on device {dev_id}: {e}")
-            return
-        # The fresh PD process comes up with patch-hardcoded defaults for
-        # hip/lop/env/test_*/mute. Re-push the user's current params once the
-        # new PD has had time to open its OSC listener, otherwise audio stays
-        # silent until the user wiggles a control. Deferred via QTimer so we
-        # don't block the Qt event loop.
-        push_init = self.callbacks.get("push_pd_init") if self.callbacks else None
-        if push_init is not None:
-            QTimer.singleShot(1500, push_init)
 
     def _rescan_audio_devices(self):
         if getattr(self, "_watchdog", None) is None:
