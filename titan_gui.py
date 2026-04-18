@@ -67,6 +67,11 @@ class TitanQtGUI(QObject):
         self.app_state = app_state
         self.callbacks = callbacks
         self.last_rendered_dmx = [-1] * 512
+        # Per-pixel cache for the RGBW Pixels view. Holds the last (sr, sg, sb)
+        # tuple rendered into each cell so we can skip setStyleSheet() when the
+        # pixel is unchanged. setStyleSheet is enormously expensive in Qt and
+        # was being called on every cell every frame. Sized in rebuild_dmx_grid.
+        self.last_rendered_pixel = []
         self.dyn_widgets = {}
 
         loader = QUiLoader()
@@ -116,6 +121,7 @@ class TitanQtGUI(QObject):
         self._setup_remote_info()
         self._setup_skew_ui()
         self._setup_mute_ui()
+        self._setup_audio_device_selector()
         self._link_widgets()
 
         if hasattr(self.ui, 'lbl_stat_audio'):
@@ -148,6 +154,128 @@ class TitanQtGUI(QObject):
         if hasattr(self.ui, 'InputState') and self.ui.InputState.layout():
             # insertWidget(0, ...) puts it at the absolute top of the layout
             self.ui.InputState.layout().insertWidget(0, self.ui.chk_mute)
+
+    def _parse_pd_device_list(self, raw):
+        """Parse the text blob from `pd -listdev` into [(device_id, name), ...]
+        entries for the audio input section only. Returns [] if the watchdog
+        couldn't find PD or the output was unexpected. The device_id values
+        are 1-indexed to match PD's own numbering."""
+        import re
+        if not raw:
+            return []
+        devices = []
+        in_input_section = False
+        for line in raw.splitlines():
+            stripped = line.strip().lower()
+            if "audio input" in stripped and "device" in stripped:
+                in_input_section = True
+                continue
+            # Any new section header ends the input section.
+            if in_input_section and ("audio output" in stripped
+                                     or "midi input" in stripped
+                                     or "midi output" in stripped):
+                break
+            if not in_input_section:
+                continue
+            m = re.match(r"\s*(\d+)\.\s+(.+?)\s*$", line)
+            if m:
+                try:
+                    devices.append((int(m.group(1)), m.group(2).strip()))
+                except ValueError:
+                    continue
+        return devices
+
+    def _setup_audio_device_selector(self):
+        watchdog = self.callbacks.get("watchdog") if self.callbacks else None
+        if watchdog is None:
+            logger.warning("No watchdog in callbacks; Audio Input Selector disabled.")
+            return
+        self._watchdog = watchdog
+
+        box = QGroupBox("Audio Input Device")
+        box.setStyleSheet("QGroupBox { font-weight: bold; }")
+        row = QHBoxLayout(box)
+        row.addWidget(QLabel("Device:"))
+
+        self.cmb_audio_dev = QComboBox()
+        self.cmb_audio_dev.addItem("(Pure Data default)", userData=None)
+
+        devices = []
+        try:
+            devices = self._parse_pd_device_list(watchdog.get_pd_audio_devices())
+        except Exception as e:
+            logger.error(f"Failed to scan PD audio devices: {e}")
+
+        if not devices:
+            logger.warning("No Pure Data audio input devices were detected.")
+        for dev_id, name in devices:
+            self.cmb_audio_dev.addItem(f"{dev_id}: {name}", userData=dev_id)
+
+        saved = self.params.get("pd_audio_dev")
+        try:
+            saved_int = int(saved) if saved is not None else None
+        except (TypeError, ValueError):
+            saved_int = None
+        if saved_int is not None:
+            idx = self.cmb_audio_dev.findData(saved_int)
+            if idx >= 0:
+                self.cmb_audio_dev.setCurrentIndex(idx)
+
+        row.addWidget(self.cmb_audio_dev, 1)
+
+        btn_rescan = QPushButton("🔄 Rescan")
+        btn_rescan.clicked.connect(self._rescan_audio_devices)
+        row.addWidget(btn_rescan)
+
+        self.cmb_audio_dev.currentIndexChanged.connect(self._on_audio_device_changed)
+
+        target_layout = None
+        if hasattr(self.ui, 'tab_audio_mapping') and self.ui.tab_audio_mapping.layout():
+            target_layout = self.ui.tab_audio_mapping.layout()
+        if target_layout is not None:
+            target_layout.insertWidget(0, box)
+        else:
+            logger.warning("tab_audio_mapping has no layout; device selector not attached.")
+
+    def _on_audio_device_changed(self, _idx):
+        dev_id = self.cmb_audio_dev.currentData()
+        self.params["pd_audio_dev"] = dev_id
+        if getattr(self, "_watchdog", None) is None:
+            return
+        try:
+            self._watchdog.start_engine(device_id=dev_id)
+            logger.info(f"Pure Data restarted with audio device_id={dev_id}.")
+        except Exception as e:
+            logger.error(f"Failed to restart Pure Data on device {dev_id}: {e}")
+            return
+        # The fresh PD process comes up with patch-hardcoded defaults for
+        # hip/lop/env/test_*/mute. Re-push the user's current params once the
+        # new PD has had time to open its OSC listener, otherwise audio stays
+        # silent until the user wiggles a control. Deferred via QTimer so we
+        # don't block the Qt event loop.
+        push_init = self.callbacks.get("push_pd_init") if self.callbacks else None
+        if push_init is not None:
+            QTimer.singleShot(1500, push_init)
+
+    def _rescan_audio_devices(self):
+        if getattr(self, "_watchdog", None) is None:
+            return
+        try:
+            devices = self._parse_pd_device_list(self._watchdog.get_pd_audio_devices())
+        except Exception as e:
+            logger.error(f"Rescan failed: {e}")
+            return
+        current_id = self.cmb_audio_dev.currentData()
+        self.cmb_audio_dev.blockSignals(True)
+        self.cmb_audio_dev.clear()
+        self.cmb_audio_dev.addItem("(Pure Data default)", userData=None)
+        for dev_id, name in devices:
+            self.cmb_audio_dev.addItem(f"{dev_id}: {name}", userData=dev_id)
+        # Re-select the previously chosen device if it still exists.
+        idx = self.cmb_audio_dev.findData(current_id) if current_id is not None else 0
+        self.cmb_audio_dev.setCurrentIndex(max(0, idx))
+        self.cmb_audio_dev.blockSignals(False)
+        logger.info(f"Audio device list rescanned ({len(devices)} input device(s) found).")
 
     def _show_startup_popup(self):
         # If they already have a default patch saved, skip the tutorial!
@@ -685,8 +813,8 @@ class TitanQtGUI(QObject):
 
                 with open(path, 'w') as f:
                     json.dump(patch_data, f, indent=4)
-        except:
-            pass
+        except (OSError, TypeError, ValueError) as e:
+            logger.error(f"Failed to save patch file: {e}")
 
     def load_patch(self, filepath=None):
         if not filepath:
@@ -813,6 +941,9 @@ class TitanQtGUI(QObject):
         if hasattr(self.dmx_grid_widget, "dmx_containers"):
             self.dmx_grid_widget.dmx_containers.clear()
         self.pixel_map = []
+        # Pixel cache is invalidated on every grid rebuild; sized once the
+        # pixel_map is fully populated below.
+        self.last_rendered_pixel = []
         cols, size = self.spin_dmx_cols.value(), self.spin_dmx_size.value()
 
         if self.cmb_view_mode.currentText() == "RGBW Pixels":
@@ -849,6 +980,7 @@ class TitanQtGUI(QObject):
                 self.dmx_boxes.append(lbl_val)
                 if hasattr(self.dmx_grid_widget, "dmx_containers"):
                     self.dmx_grid_widget.dmx_containers.append(container)
+            self.last_rendered_pixel = [None] * len(self.pixel_map)
         else:
             for i in range(512):
                 container = QWidget()
@@ -920,6 +1052,9 @@ class TitanQtGUI(QObject):
 
             self.dmx_grid_widget.update()
         self.last_rendered_dmx = [-1] * 512
+        # Force the next pixel-mode pass to repaint every cell.
+        if self.last_rendered_pixel:
+            self.last_rendered_pixel = [None] * len(self.last_rendered_pixel)
 
     def _update_monitor_univ(self, v):
         self.params["monitor_univ"] = v
@@ -1172,7 +1307,8 @@ class TitanQtGUI(QObject):
         try:
             with open(self.preset_file, 'r') as f:
                 self.app_state["preset_map"] = json.load(f)
-        except:
+        except (OSError, json.JSONDecodeError) as e:
+            logger.error(f"Failed to load preset map '{self.preset_file}': {e}. Starting with empty preset map.")
             self.app_state["preset_map"] = {}
 
         if hasattr(self.ui, 'tbl_presets'):
@@ -1336,8 +1472,8 @@ class TitanQtGUI(QObject):
 
                 with open(path, 'w') as f:
                     json.dump(preset_data, f, indent=4)
-        except:
-            pass
+        except (OSError, TypeError, ValueError) as e:
+            logger.error(f"Failed to save preset file: {e}")
 
     def load_config(self, filepath=None):
         if not filepath:
@@ -1412,8 +1548,8 @@ class TitanQtGUI(QObject):
                 self.app_state["current_preset"] = os.path.basename(filepath)
                 if hasattr(self, '_refresh_presets'):
                     self._refresh_presets()
-            except:
-                pass
+            except (OSError, json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
+                logger.error(f"Failed to load preset '{filepath}': {e}")
 
     def _link_widgets(self):
         # --- Catch Qt Designer naming bug for the Control Universe ---
@@ -1503,8 +1639,8 @@ class TitanQtGUI(QObject):
                     txt.blockSignals(True)
                     txt.setText(str(self.params[name]))
                     txt.blockSignals(False)
-            except:
-                pass
+            except Exception as e:
+                logger.error(f"_link_widgets failed for param '{name}': {e}")
 
         self._init_multiplexer()
 
@@ -1835,7 +1971,7 @@ class TitanQtGUI(QObject):
                             self.callbacks["send_osc"](name, float(val))
             self._update_dmx_overlay()
         except Exception as e:
-            pass
+            logger.error(f"apply_changes failed: {e}")
 
     def refresh_logic(self):
         if hasattr(self, 'lbl_stat_fps'):
@@ -1872,6 +2008,12 @@ class TitanQtGUI(QObject):
                 is_pixel = mode and mode.currentText() == "RGBW Pixels"
 
                 if is_pixel:
+                    cache = self.last_rendered_pixel
+                    if len(cache) != len(self.pixel_map):
+                        # Sizes can drift if the grid was rebuilt while a frame
+                        # was in flight; re-sync to the current pixel_map.
+                        cache = [None] * len(self.pixel_map)
+                        self.last_rendered_pixel = cache
                     for i, (addr, foot, name, p_num) in enumerate(self.pixel_map):
                         if i < len(self.dmx_boxes):
                             r, g, b, w = 0, 0, 0, 0
@@ -1883,6 +2025,11 @@ class TitanQtGUI(QObject):
                             sr = min(255, r + w)
                             sg = min(255, g + w)
                             sb = min(255, b + w)
+
+                            key = (sr, sg, sb)
+                            if cache[i] == key:
+                                continue
+                            cache[i] = key
 
                             bg_color = f"rgb({sr},{sg},{sb})"
                             lum = 0.299 * sr + 0.587 * sg + 0.114 * sb

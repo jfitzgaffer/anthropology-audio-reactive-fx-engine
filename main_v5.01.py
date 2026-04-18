@@ -1,6 +1,6 @@
 import os
 import sys
-# os.environ["QT_DEBUG_PLUGINS"] = "1"
+#os.environ["QT_DEBUG_PLUGINS"] = "1"
 import subprocess
 
 # ==========================================
@@ -21,8 +21,9 @@ if sys.platform == "darwin":
         # 3. Explicitly feed PySide6 its own GPS coordinates
         os.environ['QT_PLUGIN_PATH'] = os.path.join(pyside_dir, 'Qt', 'plugins')
         os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = os.path.join(pyside_dir, 'Qt', 'plugins', 'platforms')
-    except Exception:
-        pass
+    except Exception as e:
+        # Logger isn't configured yet at module import time — use stderr.
+        print(f"[BOOT] PySide6 quarantine/path setup failed: {e}", file=sys.stderr)
 # ==========================================
 
 import socket
@@ -37,6 +38,7 @@ from pythonosc import dispatcher, osc_server, udp_client
 from PySide6.QtWidgets import QApplication
 from titan_engine import RenderEngine
 from titan_gui import TitanQtGUI
+from titan_watchdog import TitanWatchdog
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -61,7 +63,8 @@ def get_local_ip():
         ip = s.getsockname()[0]
         s.close()
         return ip
-    except:
+    except OSError as e:
+        logger.warning(f"get_local_ip() failed, falling back to 127.0.0.1: {e}")
         return "127.0.0.1"
 
 
@@ -120,8 +123,9 @@ params = {
     "preset_ch": 512,
     "remote_on": 1,  # 1 = Enabled, 0 = Disabled
     "artnet_offset": 1,
-    "mute": 0
-
+    "mute": 0,
+    # Persisted Pure Data audio input device ID. None = PD default.
+    "pd_audio_dev": None,
 }
 
 params["num_fixtures"] = 1
@@ -185,8 +189,8 @@ if os.path.exists(DEFAULT_FILE):
             saved_defaults = json.load(f)
             # Remove the strict filter so all dynamic patch layers load!
             params.update(saved_defaults)
-    except:
-        pass
+    except (OSError, json.JSONDecodeError) as e:
+        logger.error(f"Failed to load default config '{DEFAULT_FILE}': {e}. Using built-in defaults.")
 
 params["art_ip"] = str(params.get("art_ip", "127.0.0.1")).strip()
 
@@ -198,7 +202,10 @@ app_state = {
     "gui_lock_time": 0.0, "sacn_seq": {u: 0 for u in range(20)},
     "audio_frame_count": 0, "current_fps": 0.0, "last_fps_time": time.time(),
     "last_ctrl_time": 0.0, "preset_text_time": 0.0,
-    "port_conflict_artnet": False, "port_conflict_osc": False, "send_error": None
+    "port_conflict_artnet": False, "port_conflict_osc": False, "send_error": None,
+    # Tracks (offset, universe) pairs we've already warned about so the
+    # offset-collision log doesn't spam every audio frame.
+    "offset_warned": set(),
 }
 
 engine = RenderEngine()
@@ -207,8 +214,8 @@ net_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 net_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 try:
     net_sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 4)
-except:
-    pass
+except OSError as e:
+    logger.warning(f"Could not set IP_MULTICAST_TTL on net_sock: {e}. sACN multicast may be limited to local link.")
 
 pd_client = udp_client.SimpleUDPClient("127.0.0.1", 5006)
 
@@ -254,8 +261,23 @@ def sender_thread():
             offset = cfg["offset"]
 
             for u, payload in buffers.items():
+                # The QLC+ "1 vs 0" compatibility shift subtracts `offset` from
+                # the patched universe at send time. Without a guard, U0 and U1
+                # both clamp to wire-universe 0 and the second one silently
+                # overwrites the first. Skip the underflow case and warn once.
+                if offset and u < offset:
+                    key = (offset, u)
+                    if key not in app_state["offset_warned"]:
+                        app_state["offset_warned"].add(key)
+                        logger.warning(
+                            f"Universe {u} cannot be sent while artnet_offset={offset} is enabled "
+                            f"(would collide with universe {offset} on wire-universe 0). "
+                            f"Re-patch this fixture to U{offset} or higher, or disable the offset."
+                        )
+                    continue
+
                 dest_ip = _dest_ip_for(u, net_mode, is_sacn, base_ip)
-                out_u = max(0, u - offset)
+                out_u = u - offset
 
                 if is_sacn:
                     app_state["sacn_seq"][out_u] = (app_state["sacn_seq"].get(out_u, 0) + 1) % 256
@@ -542,16 +564,36 @@ def artnet_listener_thread():
             sock.close()
 
 
+PD_INIT_PARAMS = ["hip", "lop", "env", "test_freq", "test_db",
+                  "test_on", "sweep_on", "input_trim", "mute"]
+
+
 def notify_pd(name, val):
-    if name in ["hip", "lop", "env", "test_on", "test_freq", "test_db", "sweep_on", "input_trim", "mute"]:
+    if name in PD_INIT_PARAMS:
         pd_client.send_message(f"/{name}", float(val))
+
+
+def push_pd_init_params():
+    """Re-send every PD-relevant parameter in the current `params` dict.
+
+    PD's filter/oscillator/mute state resets whenever the Watchdog relaunches
+    the engine (boot, audio device change, crash recovery). Without this push,
+    the new PD process runs with patch-hardcoded defaults and the user's
+    current GUI state diverges silently from what PD is actually doing — the
+    symptom is "test tone plays nothing", "mute does nothing", or "switching
+    input device kills audio until I wiggle a control".
+    """
+    for p in PD_INIT_PARAMS:
+        try:
+            pd_client.send_message(f"/{p}", float(params.get(p, 0)))
+        except Exception as e:
+            logger.warning(f"push_pd_init_params: failed to send /{p}: {e}")
 
 
 def toggle_artnet():
     app_state["artnet_active"] = not app_state["artnet_active"]
     status = "ON" if app_state["artnet_active"] else "OFF"
     logger.info(f"Network Output toggled {status}")
-
 
 def toggle_remote():
     params["remote_on"] = 0 if int(params.get("remote_on", 1)) == 1 else 1
@@ -563,8 +605,17 @@ def update_ctrl_cache(ch, val):
     if len(app_state["last_ctrl_dmx"]) > ch: app_state["last_ctrl_dmx"][ch] = int(val)
 
 
+
+watchdog = None
+
+
 def cleanup_pd():
     logger.info("Shutting down Titan Brain...")
+    if watchdog is not None:
+        try:
+            watchdog.stop_engine()
+        except Exception as e:
+            logger.warning(f"Watchdog stop_engine raised during shutdown: {e}")
     if sys.platform == "win32":
         os.system("taskkill /F /IM pd.exe 2>nul")
     else:
@@ -574,8 +625,6 @@ def cleanup_pd():
 
 
 if __name__ == "__main__":
-    import subprocess
-
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.aboutToQuit.connect(cleanup_pd)
@@ -584,24 +633,17 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, lambda sig, frame: cleanup_pd())
     signal.signal(signal.SIGTERM, lambda sig, frame: cleanup_pd())
 
-    # --- NEW: Clear old PD windows silently without killing Python! ---
-    if sys.platform == "win32":
-        os.system("taskkill /F /IM pd.exe 2>nul")
-    else:
-        os.system("pkill -9 -f audio_input.pd 2>/dev/null")
-
-    time.sleep(0.5)
-
-    pd_file_path = os.path.join(BASE_DIR, "audio_input.pd")
-    if os.path.exists(pd_file_path):
-        if sys.platform == "win32":
-            os.startfile(pd_file_path)
-            time.sleep(2.0)
-        else:
-            subprocess.Popen(["open", "-g", pd_file_path])
-            time.sleep(2.0)
-            subprocess.Popen(
-                ["osascript", "-e", 'tell application "System Events" to set visible of process "Pd" to false'])
+    # Launch Pure Data invisibly via the Watchdog. The Watchdog handles zombie
+    # sweeping on construction and applies the -nogui flag so no PD window
+    # ever appears. If the user previously selected a specific audio input
+    # device, pass that device_id in so the engine boots on the right hardware.
+    watchdog = TitanWatchdog(pd_patch_name=os.path.join(BASE_DIR, "audio_input.pd"))
+    saved_dev = params.get("pd_audio_dev")
+    try:
+        saved_dev_int = int(saved_dev) if saved_dev is not None else None
+    except (TypeError, ValueError):
+        saved_dev_int = None
+    watchdog.start_engine(device_id=saved_dev_int)
 
     disp = dispatcher.Dispatcher()
     disp.map("/audio/bands", handle_audio)
@@ -636,11 +678,24 @@ if __name__ == "__main__":
     dmx_sender_thread = threading.Thread(target=sender_thread, daemon=True, name="DMXSender")
     dmx_sender_thread.start()
 
-    callbacks = {"send_osc": notify_pd, "toggle_artnet": toggle_artnet, "toggle_remote": toggle_remote,
-                 "update_ctrl_cache": update_ctrl_cache}
+    callbacks = {
+        "send_osc": notify_pd,
+        "toggle_artnet": toggle_artnet,
+        "toggle_remote": toggle_remote,
+        "update_ctrl_cache": update_ctrl_cache,
+        # The GUI's Audio tab uses this to populate the device dropdown and
+        # to relaunch PD when the user picks a different interface.
+        "watchdog": watchdog,
+        # Called after any PD relaunch (device change) to re-sync filter,
+        # oscillator, and mute state from `params` into the fresh PD process.
+        "push_pd_init": push_pd_init_params,
+    }
     gui = TitanQtGUI(params, slider_cfg, engine, app_state, callbacks)
 
-    for p in ["hip", "lop", "env", "test_freq", "test_db", "test_on", "sweep_on", "input_trim", "mute"]:
-        pd_client.send_message(f"/{p}", float(params.get(p, 0)))
+    # Push init params shortly after launch so PD has opened its OSC listener
+    # by the time the messages arrive (PD's own loadbang + `delay 500` enables
+    # DSP ~500 ms after the patch loads; we wait a bit longer to be safe).
+    from PySide6.QtCore import QTimer
+    QTimer.singleShot(1500, push_pd_init_params)
 
     sys.exit(app.exec())
