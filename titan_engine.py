@@ -1,12 +1,23 @@
 import time
 import random
+import logging
+import threading
 from collections import deque
+
+logger = logging.getLogger("TitanEngine")
+
+# Hard cap on simultaneously tracked DMX universes. The Art-Net spec allows
+# universe addresses up to 32768, but a runaway typo (e.g. user types "9000"
+# in a fixture's universe field) must not silently grow dmx_buffers without
+# bound. 512 is well above any realistic show scale (16 nets × 16 subnets ×
+# 16 universes = 4096; we cap below that on purpose).
+MAX_UNIVERSES = 512
 
 
 def safe_float(val, default=0.0):
     try:
         return float(val)
-    except:
+    except (TypeError, ValueError):
         return default
 
 
@@ -18,6 +29,9 @@ class RenderEngine:
 
         self.fix_state = []
         self.dmx_buffers = {u: bytearray(512) for u in range(16)}
+        # Pre-allocated immutable zero block reused for fast per-frame buffer
+        # clears (avoids re-allocating `b'\x00' * 512` every audio frame).
+        self._zero_block = bytes(512)
         self.pixel_buffer = [0.0] * max_pixels_per_fix
         self.shifted_buffer = [0.0] * max_pixels_per_fix
 
@@ -25,7 +39,15 @@ class RenderEngine:
         self.scope_center = deque([0.0] * 200, maxlen=200)
         self.scope_edge = deque([0.0] * 200, maxlen=200)
 
+        self.buf_lock = threading.Lock()
+        self.published_buffers = {}
+        self.published_scopes = ([0.0] * 200, [0.0] * 200, [0.0] * 200)
+
         self.preset_mask_time = 0.0
+
+    def get_snapshot(self):
+        with self.buf_lock:
+            return self.published_buffers, self.published_scopes
 
     def _ensure_fixture_capacity(self, count):
         while len(self.fix_state) < count:
@@ -39,8 +61,21 @@ class RenderEngine:
             })
 
     def _ensure_universe_capacity(self, univ):
-        if univ not in self.dmx_buffers:
-            self.dmx_buffers[univ] = bytearray(512)
+        if univ in self.dmx_buffers:
+            return False
+        # Reject negative or absurdly high universe numbers and refuse to
+        # exceed the global cap — a typo'd "9000" would otherwise live in
+        # the dict forever and be cleared every frame.
+        if univ < 0 or univ >= MAX_UNIVERSES:
+            logger.warning(f"Rejecting out-of-range universe {univ} (allowed: 0..{MAX_UNIVERSES - 1}).")
+            return False
+        if len(self.dmx_buffers) >= MAX_UNIVERSES:
+            logger.warning(
+                f"DMX universe cap reached ({MAX_UNIVERSES}); dropping universe {univ}."
+            )
+            return False
+        self.dmx_buffers[univ] = bytearray(512)
+        return True
 
     def _get_dyn(self, params, f_idx, param_name, default):
         if int(params.get("link_all_dynamics", 0)) == 1:
@@ -51,8 +86,9 @@ class RenderEngine:
         return safe_float(params.get(param_name, default))
 
     def process_audio(self, total_db, bass_db, treble_db, params):
-        for u in self.dmx_buffers.keys():
-            self.dmx_buffers[u][:] = b'\x00' * 512
+        zero = self._zero_block
+        for buf in self.dmx_buffers.values():
+            buf[:] = zero
 
         t_start = time.perf_counter()
 
@@ -146,7 +182,8 @@ class RenderEngine:
                         t_univ = univ + (abs_ch // 512)
                         local_ch = abs_ch % 512
                         self._ensure_universe_capacity(t_univ)
-                        self.dmx_buffers[t_univ][local_ch] = 255
+                        if t_univ in self.dmx_buffers:
+                            self.dmx_buffers[t_univ][local_ch] = 255
                 continue
 
             f_state = self.fix_state[f_idx]
@@ -355,10 +392,19 @@ class RenderEngine:
                     local_ch = abs_ch % 512
 
                     self._ensure_universe_capacity(t_univ)
-                    self.dmx_buffers[t_univ][local_ch] = max(0, min(255, final_merged_val))
+                    if t_univ in self.dmx_buffers:
+                        self.dmx_buffers[t_univ][local_ch] = max(0, min(255, final_merged_val))
 
         self.scope_audio.append(global_audio_scope_val)
         self.audio_latency_ms = pd_buffer_ms
         self.dsp_latency_ms = (time.perf_counter() - t_start) * 1000.0
 
-        return self.dmx_buffers
+        with self.buf_lock:
+            self.published_buffers = {u: bytes(b) for u, b in self.dmx_buffers.items()}
+            self.published_scopes = (
+                list(self.scope_audio),
+                list(self.scope_center),
+                list(self.scope_edge),
+            )
+
+        return self.published_buffers
