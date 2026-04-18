@@ -32,7 +32,7 @@ class TitanWatchdog:
         if not self.pd_executable:
             print("WARNING: Could not find Pure Data in the Applications folder.")
 
-    def start_engine(self, device_id=None):
+    def start_engine(self, device_id=None, output_device_id=None):
         """Kills any frozen PD instance, then starts a fresh one instantly."""
         self.stop_engine()
 
@@ -48,6 +48,14 @@ class TitanWatchdog:
         # If the user selected a specific audio interface, inject it here
         if device_id is not None:
             cmd.extend(["-audioindev", str(device_id)])
+
+        # Output device — critical when using BlackHole or another loopback
+        # for INPUT. Without this, PD picks the system default output, which
+        # on a BlackHole-as-input rig is often BlackHole itself — so the tone
+        # and any monitor signal vanish into the virtual loopback and never
+        # reach real speakers.
+        if output_device_id is not None:
+            cmd.extend(["-audiooutdev", str(output_device_id)])
 
         # Add the patch file to the end of the command
         cmd.append(self.pd_patch_name)

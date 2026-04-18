@@ -122,7 +122,13 @@ class TitanQtGUI(QObject):
         self._setup_skew_ui()
         self._setup_mute_ui()
         self._setup_audio_device_selector()
+        self._setup_panic_button()
         self._link_widgets()
+
+        # Intercept the main window's Close event so we can prompt the gaffer
+        # to confirm when Art-Net is still transmitting — filter installed in
+        # eventFilter() below.
+        self.ui.installEventFilter(self)
 
         if hasattr(self.ui, 'lbl_stat_audio'):
             self.ui.lbl_stat_audio.installEventFilter(self)
@@ -145,6 +151,13 @@ class TitanQtGUI(QObject):
         self.timer.start(33)
         self.ui.show()
 
+        # Silent autosave once a minute. Writes the live params to
+        # titan_autosave.json so the gaffer can recover state after a crash
+        # or forced quit without overwriting their saved default patch.
+        self._autosave_timer = QTimer()
+        self._autosave_timer.timeout.connect(self._autosave)
+        self._autosave_timer.start(60000)
+
         QTimer.singleShot(600, self._show_startup_popup)
 
     def _setup_mute_ui(self):
@@ -155,27 +168,81 @@ class TitanQtGUI(QObject):
             # insertWidget(0, ...) puts it at the absolute top of the layout
             self.ui.InputState.layout().insertWidget(0, self.ui.chk_mute)
 
-    def _parse_pd_device_list(self, raw):
-        """Parse the text blob from `pd -listdev` into [(device_id, name), ...]
-        entries for the audio input section only. Returns [] if the watchdog
-        couldn't find PD or the output was unexpected. The device_id values
-        are 1-indexed to match PD's own numbering."""
+    _PANIC_BUTTON_IDLE_STYLE = (
+        "QPushButton { background-color: #cc0000; color: white; font-weight: bold; "
+        "font-size: 14px; padding: 12px; border: 2px solid #660000; border-radius: 4px; } "
+        "QPushButton:hover { background-color: #ff0000; } "
+        "QPushButton:pressed { background-color: #880000; }"
+    )
+    _PANIC_BUTTON_ACTIVE_STYLE = (
+        "QPushButton { background-color: #000; color: #ff5555; font-weight: bold; "
+        "font-size: 14px; padding: 12px; border: 3px solid #ff0000; border-radius: 4px; }"
+    )
+
+    def _setup_panic_button(self):
+        if not hasattr(self.ui, 'box_status'):
+            logger.warning("box_status not found; Panic Blackout button not attached.")
+            return
+        layout = self.ui.box_status.layout()
+        if layout is None:
+            logger.warning("box_status has no layout; Panic Blackout button not attached.")
+            return
+        self.btn_panic = QPushButton("PANIC BLACKOUT")
+        self.btn_panic.setStyleSheet(self._PANIC_BUTTON_IDLE_STYLE)
+        self.btn_panic.setMinimumHeight(50)
+        self.btn_panic.setCursor(Qt.PointingHandCursor)
+        self.btn_panic.clicked.connect(self.toggle_panic_blackout)
+        layout.addWidget(self.btn_panic)
+
+    def toggle_panic_blackout(self):
+        active = not bool(self.app_state.get("panic_blackout", False))
+        self.app_state["panic_blackout"] = active
+        if hasattr(self, 'btn_panic'):
+            if active:
+                self.btn_panic.setText("BLACKOUT ACTIVE — CLICK TO RESTORE")
+                self.btn_panic.setStyleSheet(self._PANIC_BUTTON_ACTIVE_STYLE)
+            else:
+                self.btn_panic.setText("PANIC BLACKOUT")
+                self.btn_panic.setStyleSheet(self._PANIC_BUTTON_IDLE_STYLE)
+        logger.warning(f"PANIC BLACKOUT {'ENGAGED' if active else 'RELEASED'}")
+
+    def _autosave(self):
+        try:
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "titan_autosave.json")
+            with open(path, "w") as f:
+                json.dump(self.params, f, indent=4)
+        except (OSError, TypeError, ValueError) as e:
+            logger.warning(f"Autosave to titan_autosave.json failed: {e}")
+
+    @staticmethod
+    def _coerce_dev_id(v):
+        try:
+            return int(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _parse_pd_device_list(self, raw, section="input"):
+        """Parse `pd -listdev` text into [(device_id, name), ...] for one
+        section. `section` is "input" or "output". IDs are 1-indexed to
+        match PD's own numbering. Returns [] if the blob is empty or no
+        entries are found in the requested section."""
         import re
         if not raw:
             return []
+        target = "audio output" if section == "output" else "audio input"
         devices = []
-        in_input_section = False
+        in_section = False
         for line in raw.splitlines():
             stripped = line.strip().lower()
-            if "audio input" in stripped and "device" in stripped:
-                in_input_section = True
+            if target in stripped and "device" in stripped:
+                in_section = True
                 continue
-            # Any new section header ends the input section.
-            if in_input_section and ("audio output" in stripped
-                                     or "midi input" in stripped
-                                     or "midi output" in stripped):
-                break
-            if not in_input_section:
+            # Any OTHER section header ends ours. Listing every possible
+            # header avoids breaking when pd adds a new section in future.
+            if in_section and stripped.endswith("devices:"):
+                if target not in stripped:
+                    break
+            if not in_section:
                 continue
             m = re.match(r"\s*(\d+)\.\s+(.+?)\s*$", line)
             if m:
@@ -185,6 +252,16 @@ class TitanQtGUI(QObject):
                     continue
         return devices
 
+    def _populate_device_combo(self, combo, devices, saved_id):
+        combo.clear()
+        combo.addItem("(Pure Data default)", userData=None)
+        for dev_id, name in devices:
+            combo.addItem(f"{dev_id}: {name}", userData=dev_id)
+        if saved_id is not None:
+            idx = combo.findData(saved_id)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+
     def _setup_audio_device_selector(self):
         watchdog = self.callbacks.get("watchdog") if self.callbacks else None
         if watchdog is None:
@@ -192,42 +269,60 @@ class TitanQtGUI(QObject):
             return
         self._watchdog = watchdog
 
-        box = QGroupBox("Audio Input Device")
-        box.setStyleSheet("QGroupBox { font-weight: bold; }")
-        row = QHBoxLayout(box)
-        row.addWidget(QLabel("Device:"))
-
-        self.cmb_audio_dev = QComboBox()
-        self.cmb_audio_dev.addItem("(Pure Data default)", userData=None)
-
-        devices = []
         try:
-            devices = self._parse_pd_device_list(watchdog.get_pd_audio_devices())
+            raw = watchdog.get_pd_audio_devices()
         except Exception as e:
             logger.error(f"Failed to scan PD audio devices: {e}")
-
-        if not devices:
+            raw = ""
+        in_devices = self._parse_pd_device_list(raw, "input")
+        out_devices = self._parse_pd_device_list(raw, "output")
+        if not in_devices:
             logger.warning("No Pure Data audio input devices were detected.")
-        for dev_id, name in devices:
-            self.cmb_audio_dev.addItem(f"{dev_id}: {name}", userData=dev_id)
 
-        saved = self.params.get("pd_audio_dev")
-        try:
-            saved_int = int(saved) if saved is not None else None
-        except (TypeError, ValueError):
-            saved_int = None
-        if saved_int is not None:
-            idx = self.cmb_audio_dev.findData(saved_int)
-            if idx >= 0:
-                self.cmb_audio_dev.setCurrentIndex(idx)
+        box = QGroupBox("Audio Input Device")
+        box.setStyleSheet("QGroupBox { font-weight: bold; }")
+        v = QVBoxLayout(box)
 
-        row.addWidget(self.cmb_audio_dev, 1)
+        # Inline status indicator — mirrors the Status-box audio indicator so
+        # the gaffer can tell at a glance whether audio is flowing while they
+        # pick a device. Updated in refresh_logic alongside lbl_stat_audio.
+        row_stat = QHBoxLayout()
+        row_stat.addWidget(QLabel("Audio Input:"))
+        self.lbl_stat_audio_inline = QLabel("🔴 WAIT")
+        self.lbl_stat_audio_inline.setStyleSheet("color: #ff0000; font-weight: bold;")
+        row_stat.addWidget(self.lbl_stat_audio_inline)
+        row_stat.addStretch(1)
+        v.addLayout(row_stat)
+
+        row_in = QHBoxLayout()
+        row_in.addWidget(QLabel("Input:"))
+        self.cmb_audio_dev = QComboBox()
+        self._populate_device_combo(
+            self.cmb_audio_dev, in_devices,
+            self._coerce_dev_id(self.params.get("pd_audio_dev")),
+        )
+        row_in.addWidget(self.cmb_audio_dev, 1)
 
         btn_rescan = QPushButton("🔄 Rescan")
         btn_rescan.clicked.connect(self._rescan_audio_devices)
-        row.addWidget(btn_rescan)
+        row_in.addWidget(btn_rescan)
 
         self.cmb_audio_dev.currentIndexChanged.connect(self._on_audio_device_changed)
+        v.addLayout(row_in)
+
+        # Output device row. Critical for BlackHole-as-input setups: without
+        # an explicit output pick, PD may route its tone/monitor into the
+        # virtual loopback and nothing reaches real speakers.
+        row_out = QHBoxLayout()
+        row_out.addWidget(QLabel("Output:"))
+        self.cmb_audio_dev_out = QComboBox()
+        self._populate_device_combo(
+            self.cmb_audio_dev_out, out_devices,
+            self._coerce_dev_id(self.params.get("pd_audio_dev_out")),
+        )
+        row_out.addWidget(self.cmb_audio_dev_out, 1)
+        self.cmb_audio_dev_out.currentIndexChanged.connect(self._on_audio_output_device_changed)
+        v.addLayout(row_out)
 
         target_layout = None
         if hasattr(self.ui, 'tab_audio_mapping') and self.ui.tab_audio_mapping.layout():
@@ -238,35 +333,74 @@ class TitanQtGUI(QObject):
             logger.warning("tab_audio_mapping has no layout; device selector not attached.")
 
     def _on_audio_device_changed(self, _idx):
-        dev_id = self.cmb_audio_dev.currentData()
-        self.params["pd_audio_dev"] = dev_id
+        self.params["pd_audio_dev"] = self.cmb_audio_dev.currentData()
+        self._restart_pd_with_current_devices()
+
+    def _on_audio_output_device_changed(self, _idx):
+        self.params["pd_audio_dev_out"] = self.cmb_audio_dev_out.currentData()
+        self._restart_pd_with_current_devices()
+
+    def _restart_pd_with_current_devices(self):
         if getattr(self, "_watchdog", None) is None:
             return
+        in_id = self.cmb_audio_dev.currentData() if hasattr(self, 'cmb_audio_dev') else None
+        out_id = self.cmb_audio_dev_out.currentData() if hasattr(self, 'cmb_audio_dev_out') else None
         try:
-            self._watchdog.start_engine(device_id=dev_id)
-            logger.info(f"Pure Data restarted with audio device_id={dev_id}.")
+            self._watchdog.start_engine(device_id=in_id, output_device_id=out_id)
+            logger.info(f"Pure Data restarted (in={in_id}, out={out_id}).")
         except Exception as e:
-            logger.error(f"Failed to restart Pure Data on device {dev_id}: {e}")
+            logger.error(f"Failed to restart Pure Data (in={in_id}, out={out_id}): {e}")
+            return
+        # The fresh PD process comes up with patch-hardcoded defaults for
+        # hip/lop/env/test_*/mute. Re-push the user's current params once the
+        # new PD has had time to open its OSC listener, otherwise audio stays
+        # silent until the user wiggles a control. Deferred via QTimer so we
+        # don't block the Qt event loop.
+        push_init = self.callbacks.get("push_pd_init") if self.callbacks else None
+        if push_init is not None:
+            QTimer.singleShot(1500, push_init)
 
     def _rescan_audio_devices(self):
         if getattr(self, "_watchdog", None) is None:
             return
         try:
-            devices = self._parse_pd_device_list(self._watchdog.get_pd_audio_devices())
+            raw = self._watchdog.get_pd_audio_devices()
         except Exception as e:
             logger.error(f"Rescan failed: {e}")
             return
-        current_id = self.cmb_audio_dev.currentData()
-        self.cmb_audio_dev.blockSignals(True)
-        self.cmb_audio_dev.clear()
-        self.cmb_audio_dev.addItem("(Pure Data default)", userData=None)
-        for dev_id, name in devices:
-            self.cmb_audio_dev.addItem(f"{dev_id}: {name}", userData=dev_id)
-        # Re-select the previously chosen device if it still exists.
-        idx = self.cmb_audio_dev.findData(current_id) if current_id is not None else 0
-        self.cmb_audio_dev.setCurrentIndex(max(0, idx))
-        self.cmb_audio_dev.blockSignals(False)
-        logger.info(f"Audio device list rescanned ({len(devices)} input device(s) found).")
+        in_devs = self._parse_pd_device_list(raw, "input")
+        out_devs = self._parse_pd_device_list(raw, "output")
+        for combo, devs in ((self.cmb_audio_dev, in_devs),
+                            (self.cmb_audio_dev_out, out_devs)):
+            current_id = combo.currentData()
+            combo.blockSignals(True)
+            self._populate_device_combo(combo, devs, current_id)
+            combo.blockSignals(False)
+        logger.info(f"Audio devices rescanned ({len(in_devs)} input, {len(out_devs)} output).")
+
+    def _show_audio_device_popup(self):
+        """Quick device-picker popup bound to the middle-section status dot.
+        A fresh combo is populated from the main input combo's current items;
+        selecting in the popup drives the main combo, which triggers the usual
+        restart-PD flow — no duplicate routing logic."""
+        if not hasattr(self, 'cmb_audio_dev'):
+            return
+        dlg = QDialog(self.ui)
+        dlg.setWindowTitle("Audio Input Device")
+        dlg.setMinimumWidth(400)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel("Select an audio input device:"))
+        popup_combo = QComboBox()
+        for i in range(self.cmb_audio_dev.count()):
+            popup_combo.addItem(self.cmb_audio_dev.itemText(i),
+                                userData=self.cmb_audio_dev.itemData(i))
+        popup_combo.setCurrentIndex(self.cmb_audio_dev.currentIndex())
+        popup_combo.currentIndexChanged.connect(self.cmb_audio_dev.setCurrentIndex)
+        lay.addWidget(popup_combo)
+        btn = QPushButton("Close")
+        btn.clicked.connect(dlg.accept)
+        lay.addWidget(btn)
+        dlg.exec()
 
     def _show_startup_popup(self):
         # If they already have a default patch saved, skip the tutorial!
@@ -284,9 +418,26 @@ class TitanQtGUI(QObject):
         msg.exec()
 
     def eventFilter(self, obj, event):
+        # Confirm-before-quit: if the user closes the main window while
+        # Art-Net is still transmitting, warn them first. aboutToQuit is
+        # already wired to cleanup_pd in main, so accepting the close is
+        # enough — we don't need to call cleanup ourselves.
+        if obj is self.ui and event.type() == QEvent.Close:
+            if self.app_state.get("artnet_active", False):
+                reply = QMessageBox.question(
+                    self.ui,
+                    "Confirm Quit",
+                    "Output is active. Are you sure you want to quit?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if reply != QMessageBox.Yes:
+                    event.ignore()
+                    return True
+
         if event.type() == QEvent.MouseButtonPress:
             if obj == getattr(self.ui, 'lbl_stat_audio', None):
-                self._show_audio_troubleshoot()
+                self._show_audio_device_popup()
                 return True
             elif obj == getattr(self.ui, 'lbl_stat_artnet', None):
                 self._show_artnet_troubleshoot()
@@ -300,22 +451,6 @@ class TitanQtGUI(QObject):
 
         # This MUST sit outside the MouseButtonPress block!
         return super().eventFilter(obj, event)
-
-    def _show_audio_troubleshoot(self):
-        if self.app_state.get("port_conflict_osc"):
-            QMessageBox.critical(self.ui, "Port Conflict Detected",
-                                 "The audio data port (5005) is currently blocked or in use by another application.\n\n"
-                                 "Close any other instances of Titan Engine or Pure Data, and restart.")
-        elif time.time() - self.app_state.get("pd_last_time", 0) > 0.1:
-            QMessageBox.warning(self.ui, "Audio Input Troubleshooting",
-                                "No audio data is being received. Please check the following:\n\n"
-                                "1. Verify that Pure Data (pd.exe / Pd) is currently running.\n"
-                                "2. Look at the Pure Data console window for any red error messages.\n"
-                                "3. Ensure the 'DSP' checkbox in the main Pure Data window is checked.\n"
-                                "4. Go to Media -> Audio Settings in Pure Data and ensure your USB Audio Interface is selected as the Input Device.")
-        else:
-            QMessageBox.information(self.ui, "Audio Input",
-                                    "Audio input is actively receiving data and functioning normally.")
 
     def _show_artnet_troubleshoot(self):
         is_active = self.app_state.get("artnet_active", False)
@@ -489,6 +624,10 @@ class TitanQtGUI(QObject):
         self.plot.showGrid(x=False, y=True, alpha=0.3)
         self.plot.setYRange(0, 1.1)
         self.plot.hideAxis('bottom')
+        # addLegend before plot() so each curve's name="…" auto-registers.
+        self.plot.addLegend(offset=(10, 10), labelTextColor='#dddddd',
+                            brush=pg.mkBrush(0, 0, 0, 160),
+                            pen=pg.mkPen('#333'))
 
         if self.ui.scope_canvas.layout():
             self.ui.scope_canvas.layout().addWidget(self.plot)
@@ -497,9 +636,9 @@ class TitanQtGUI(QObject):
             layout.setContentsMargins(0, 0, 0, 0)
             layout.addWidget(self.plot)
 
-        self.curve_audio = self.plot.plot(pen=pg.mkPen('#ffaa00', width=2))
-        self.curve_center = self.plot.plot(pen=pg.mkPen('#00ffff', width=3))
-        self.curve_edge = self.plot.plot(pen=pg.mkPen('#ff00ff', width=3))
+        self.curve_audio = self.plot.plot(pen=pg.mkPen('#ffaa00', width=2), name="Audio In")
+        self.curve_center = self.plot.plot(pen=pg.mkPen('#00ffff', width=3), name="Center")
+        self.curve_edge = self.plot.plot(pen=pg.mkPen('#ff00ff', width=3), name="Edge")
 
     def _setup_skew_ui(self):
         row_skew = QHBoxLayout()
@@ -1213,6 +1352,19 @@ class TitanQtGUI(QObject):
 
     def _setup_performance_monitors(self):
         l = self.ui.box_status.layout()
+
+        # Test Tone row — added first so it sits directly below the
+        # Remote Control row (which is the last .ui-defined status row).
+        row_test = QHBoxLayout()
+        self.lbl_stat_test = QLabel("⚫ OFF")
+        self.lbl_stat_test.setStyleSheet("color: #555555; font-weight: bold;")
+        row_test.addWidget(QLabel("Test Tone:"))
+        row_test.addWidget(self.lbl_stat_test)
+        l.addLayout(row_test)
+
+        self.lbl_stat_test.setCursor(Qt.PointingHandCursor)
+        self.lbl_stat_test.installEventFilter(self)
+
         line = QFrame()
         line.setFrameShape(QFrame.HLine)
         line.setStyleSheet("background-color: #555; margin-top: 5px; margin-bottom: 5px;")
@@ -1238,17 +1390,6 @@ class TitanQtGUI(QObject):
         row_buf.addWidget(QLabel("Audio Buffer:"))
         row_buf.addWidget(self.lbl_stat_buf)
         l.addLayout(row_buf)
-
-        # --- NEW: Test Tone Indicator ---
-        row_test = QHBoxLayout()
-        self.lbl_stat_test = QLabel("⚫ OFF")
-        self.lbl_stat_test.setStyleSheet("color: #555555; font-weight: bold;")
-        row_test.addWidget(QLabel("Test Tone:"))
-        row_test.addWidget(self.lbl_stat_test)
-        l.addLayout(row_test)
-
-        self.lbl_stat_test.setCursor(Qt.PointingHandCursor)
-        self.lbl_stat_test.installEventFilter(self)
 
     def _setup_remote_info(self):
         box = QGroupBox("Control Universe DMX Map (Fixed)")
@@ -2052,14 +2193,16 @@ class TitanQtGUI(QObject):
         if hasattr(self, 'app_state'):
             # --- 1. AUDIO STATUS ---
             if self.app_state.get("port_conflict_osc"):
-                self.ui.lbl_stat_audio.setText("🔴 PORT IN USE")
-                self.ui.lbl_stat_audio.setStyleSheet("color: #ff0000; font-weight: bold;")
+                audio_text, audio_css = "🔴 PORT IN USE", "color: #ff0000; font-weight: bold;"
             elif time.time() - self.app_state.get("pd_last_time", 0) < 0.1:
-                self.ui.lbl_stat_audio.setText("🟢 ACTIVE")
-                self.ui.lbl_stat_audio.setStyleSheet("color: #00ff00; font-weight: bold;")
+                audio_text, audio_css = "🟢 ACTIVE", "color: #00ff00; font-weight: bold;"
             else:
-                self.ui.lbl_stat_audio.setText("🔴 WAIT")
-                self.ui.lbl_stat_audio.setStyleSheet("color: #ff0000; font-weight: normal;")
+                audio_text, audio_css = "🔴 WAIT", "color: #ff0000; font-weight: normal;"
+            self.ui.lbl_stat_audio.setText(audio_text)
+            self.ui.lbl_stat_audio.setStyleSheet(audio_css)
+            if hasattr(self, 'lbl_stat_audio_inline'):
+                self.lbl_stat_audio_inline.setText(audio_text)
+                self.lbl_stat_audio_inline.setStyleSheet(audio_css)
 
             # --- 2. NETWORK OUTPUT STATUS ---
             if self.app_state.get("artnet_active", False):
