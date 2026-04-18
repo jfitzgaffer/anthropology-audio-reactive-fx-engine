@@ -458,11 +458,14 @@ class TitanQtGUI(QObject):
         row_f = QHBoxLayout()
         self.chk_master_od_force_off = QCheckBox("Global Force Off")
         self.chk_master_od_force_off.setChecked(bool(self.params.get("master_od_force_off", 0)))
-        self.chk_master_od_force_off.toggled.connect(lambda v: self._update_chk_simple("master_od_force_off", v))
 
         self.chk_master_od_force_on = QCheckBox("Global Force On")
         self.chk_master_od_force_on.setChecked(bool(self.params.get("master_od_force_on", 0)))
-        self.chk_master_od_force_on.toggled.connect(lambda v: self._update_chk_simple("master_od_force_on", v))
+
+        self.chk_master_od_force_off.toggled.connect(lambda v: self._update_chk_force_exclusive(
+            "master_od_force_off", "master_od_force_on", self.chk_master_od_force_on, v))
+        self.chk_master_od_force_on.toggled.connect(lambda v: self._update_chk_force_exclusive(
+            "master_od_force_on", "master_od_force_off", self.chk_master_od_force_off, v))
 
         row_f.addWidget(self.chk_master_od_force_off)
         row_f.addWidget(self.chk_master_od_force_on)
@@ -491,19 +494,25 @@ class TitanQtGUI(QObject):
 
         self.chk_master_ana_force_off = QCheckBox("Force Static Noise Off")
         self.chk_master_ana_force_off.setChecked(bool(self.params.get("master_ana_force_off", 0)))
-        self.chk_master_ana_force_off.toggled.connect(lambda v: self._update_chk_simple("master_ana_force_off", v))
 
         self.chk_master_ana_force_on = QCheckBox("Force Static Noise On")
         self.chk_master_ana_force_on.setChecked(bool(self.params.get("master_ana_force_on", 0)))
-        self.chk_master_ana_force_on.toggled.connect(lambda v: self._update_chk_simple("master_ana_force_on", v))
+
+        self.chk_master_ana_force_off.toggled.connect(lambda v: self._update_chk_force_exclusive(
+            "master_ana_force_off", "master_ana_force_on", self.chk_master_ana_force_on, v))
+        self.chk_master_ana_force_on.toggled.connect(lambda v: self._update_chk_force_exclusive(
+            "master_ana_force_on", "master_ana_force_off", self.chk_master_ana_force_off, v))
 
         self.chk_master_digi_force_off = QCheckBox("Force Digital Glitch Off")
         self.chk_master_digi_force_off.setChecked(bool(self.params.get("master_digi_force_off", 0)))
-        self.chk_master_digi_force_off.toggled.connect(lambda v: self._update_chk_simple("master_digi_force_off", v))
 
         self.chk_master_digi_force_on = QCheckBox("Force Digital Glitch On")
         self.chk_master_digi_force_on.setChecked(bool(self.params.get("master_digi_force_on", 0)))
-        self.chk_master_digi_force_on.toggled.connect(lambda v: self._update_chk_simple("master_digi_force_on", v))
+
+        self.chk_master_digi_force_off.toggled.connect(lambda v: self._update_chk_force_exclusive(
+            "master_digi_force_off", "master_digi_force_on", self.chk_master_digi_force_on, v))
+        self.chk_master_digi_force_on.toggled.connect(lambda v: self._update_chk_force_exclusive(
+            "master_digi_force_on", "master_digi_force_off", self.chk_master_digi_force_off, v))
 
         f_lay.addWidget(self.chk_master_ana_force_off, 0, 0)
         f_lay.addWidget(self.chk_master_ana_force_on, 0, 1)
@@ -610,6 +619,16 @@ class TitanQtGUI(QObject):
             self.rebuild_dmx_grid()
         else:
             self._update_dmx_overlay()
+
+    def _update_chk_force_exclusive(self, name, partner_name, partner_chk, val):
+        if val and partner_chk.isChecked():
+            partner_chk.blockSignals(True)
+            partner_chk.setChecked(False)
+            partner_chk.blockSignals(False)
+            self.params[partner_name] = 0
+            if "send_osc" in self.callbacks:
+                self.callbacks["send_osc"](partner_name, 0.0)
+        self._update_chk_simple(name, val)
 
     def _update_txt_simple(self, name, val):
         self.params[name] = val

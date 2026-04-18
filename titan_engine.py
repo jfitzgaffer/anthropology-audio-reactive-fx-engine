@@ -122,10 +122,13 @@ class RenderEngine:
                 chain_info[info["f_idx"]] = {"start": curr_start, "total": total_p}
                 curr_start += info["p_count"]
 
+        first_active_idx = None
         for f_idx in range(num_fixtures):
             fix_num = f_idx + 1
             if int(params.get(f"f{fix_num}_active", 0)) == 0:
                 continue
+            if first_active_idx is None:
+                first_active_idx = f_idx
 
             p_count = min(int(params.get(f"f{fix_num}_pix", 16)), self.max_pixels_per_fix)
             p_foot = int(params.get(f"f{fix_num}_foot", 4))
@@ -326,7 +329,7 @@ class RenderEngine:
 
                 pixel_hotness = od_factor * (final_val / 255.0) * od_desat
 
-                if f_idx == 0:
+                if f_idx == first_active_idx:
                     if i == int(p_count / 2): self.scope_center.append(final_val / 255.0)
                     if i == 0: self.scope_edge.append(final_val / 255.0)
 
