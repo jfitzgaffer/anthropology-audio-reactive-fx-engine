@@ -248,6 +248,23 @@ def _dest_ip_for(u, net_mode, is_sacn, base_ip):
     return base_ip
 
 
+def _send_universe(out_u, payload, dest_ip, target_port, is_sacn, *,
+                   priority, src_name, is_preview, art_net_val, art_sub_val):
+    """Build the protocol packet for `out_u` and ship it. Returns (ok, err_str)."""
+    if is_sacn:
+        app_state["sacn_seq"][out_u] = (app_state["sacn_seq"].get(out_u, 0) + 1) % 256
+        packet = build_sacn_packet(out_u, payload, app_state["sacn_seq"][out_u],
+                                   priority, src_name, is_preview)
+    else:
+        packet = _build_artnet_packet(out_u, payload, art_net_val, art_sub_val)
+
+    try:
+        net_sock.sendto(packet, (dest_ip, target_port))
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
 def sender_thread():
     logger.info("DMX sender thread running.")
     while True:
@@ -286,36 +303,24 @@ def sender_thread():
 
                 dest_ip = _dest_ip_for(u, net_mode, is_sacn, base_ip)
                 out_u = u - offset
-
-                if is_sacn:
-                    app_state["sacn_seq"][out_u] = (app_state["sacn_seq"].get(out_u, 0) + 1) % 256
-                    packet = build_sacn_packet(out_u, payload, app_state["sacn_seq"][out_u],
-                                               priority, src_name, is_preview)
-                else:
-                    packet = _build_artnet_packet(out_u, payload, art_net_val, art_sub_val)
-
-                try:
-                    net_sock.sendto(packet, (dest_ip, target_port))
+                ok, err = _send_universe(out_u, payload, dest_ip, target_port, is_sacn,
+                                         priority=priority, src_name=src_name, is_preview=is_preview,
+                                         art_net_val=art_net_val, art_sub_val=art_sub_val)
+                if ok:
                     app_state["art_packets"] += 1
                     app_state["send_error"] = None
-                except Exception as e:
-                    app_state["send_error"] = str(e)
-                    logger.warning(f"Network Blocked! Reason: {e} | Target IP: '{dest_ip}'")
+                else:
+                    app_state["send_error"] = err
+                    logger.warning(f"Network Blocked! Reason: {err} | Target IP: '{dest_ip}'")
 
             fb_univ = 14
             fb_dest = _dest_ip_for(fb_univ, net_mode, is_sacn, base_ip)
             fb_univ_out = max(0, fb_univ - offset)
-            if is_sacn:
-                app_state["sacn_seq"][fb_univ_out] = (app_state["sacn_seq"].get(fb_univ_out, 0) + 1) % 256
-                fb_packet = build_sacn_packet(fb_univ_out, fb_payload, app_state["sacn_seq"][fb_univ_out],
-                                              priority, src_name, is_preview)
-            else:
-                fb_packet = _build_artnet_packet(fb_univ_out, fb_payload, art_net_val, art_sub_val)
-
-            try:
-                net_sock.sendto(fb_packet, (fb_dest, target_port))
-            except Exception as e:
-                app_state["send_error"] = str(e)
+            ok, err = _send_universe(fb_univ_out, fb_payload, fb_dest, target_port, is_sacn,
+                                     priority=priority, src_name=src_name, is_preview=is_preview,
+                                     art_net_val=art_net_val, art_sub_val=art_sub_val)
+            if not ok:
+                app_state["send_error"] = err
 
         except Exception:
             logger.exception("sender_thread error")

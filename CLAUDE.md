@@ -115,12 +115,6 @@ Lighting console ──Art-Net→ UDP 6454 ──→ artnet_listener_thread ─�
 
 ## Inefficiencies / refactor targets
 
-24. **Duplicated preset whitelist** (`titan_gui.py:1419–1427` and `1454–1462`). Promote to a class constant `PRESET_WHITELIST`.
-
-25. **Two near-identical packet builders** in `main_v5.01.py` (main loop and feedback universe). Extract `send_universe(univ, payload, is_sacn, ...)`.
-
-26. **Three copies of `custom_env` in `audio_input.pd`.** Refactor into a single `custom_env.pd` abstraction, referenced three times.
-
 27. **Per-pixel Python loops in the engine.** Fine for small counts; for >64 pixels vectorize with `numpy` (attack/release, gamma, clamp).
 
 28. **DMX buffer clear allocates.** `self.dmx_buffers[u][:] = b'\x00' * 512` creates a new bytes object. Keep a pre-allocated zero buffer, or use `ctypes.memset`.

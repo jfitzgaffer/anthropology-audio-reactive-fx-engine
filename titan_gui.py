@@ -59,6 +59,19 @@ class DebugWindow(QWidget):
 
 
 class TitanQtGUI(QObject):
+    # Single source of truth for what params an effect-preset .json file
+    # contains on save and consumes on load. Patch-level params (network,
+    # per-fixture address, color macros, etc.) are explicitly excluded.
+    PRESET_WHITELIST = (
+        "hip", "lop", "env", "input_trim", "noise_gate", "mute",
+        "skew", "width",
+        "drive", "knee", "expand", "floor", "ceiling", "gamma", "scale", "eq_tilt", "led_gamma",
+        "atk_c", "rel_c", "atk_e", "rel_e", "time_gamma",
+        "jitter_on", "jitter_thresh", "jitter_amount", "dmx_smooth_on", "smooth_size",
+        "glitch_digi_amt", "glitch_digi_block", "glitch_ana_amt", "glitch_ana_tear", "glitch_ana_noise",
+        "od_thresh", "od_desat", "od_glitch", "link_all_dynamics",
+    )
+
     def __init__(self, params, slider_cfg, engine, app_state, callbacks):
         super().__init__()
         self.params = params
@@ -1588,18 +1601,7 @@ class TitanQtGUI(QObject):
                 if not path.lower().endswith('.json'):
                     path += '.json'
 
-                # --- NEW: Strict Whitelist for Presets ---
-                preset_whitelist = [
-                    "hip", "lop", "env", "input_trim", "noise_gate", "mute",
-                    "skew", "width",
-                    "drive", "knee", "expand", "floor", "ceiling", "gamma", "scale", "eq_tilt", "led_gamma",
-                    "atk_c", "rel_c", "atk_e", "rel_e", "time_gamma",
-                    "jitter_on", "jitter_thresh", "jitter_amount", "dmx_smooth_on", "smooth_size",
-                    "glitch_digi_amt", "glitch_digi_block", "glitch_ana_amt", "glitch_ana_tear", "glitch_ana_noise",
-                    "od_thresh", "od_desat", "od_glitch", "link_all_dynamics"
-                ]
-
-                preset_data = {k: v for k, v in self.params.items() if k in preset_whitelist}
+                preset_data = {k: v for k, v in self.params.items() if k in self.PRESET_WHITELIST}
                 preset_data["file_type"] = "titan_preset"
 
                 with open(path, 'w') as f:
@@ -1623,17 +1625,7 @@ class TitanQtGUI(QObject):
                     print("⚠️ Blocked: Cannot load a Patch file into the Preset engine!")
                     return
 
-                # --- NEW: Strict Whitelist for Presets ---
-                preset_whitelist = [
-                    "hip", "lop", "env", "input_trim", "noise_gate", "mute",
-                    "skew", "width",
-                    "drive", "knee", "expand", "floor", "ceiling", "gamma", "scale", "eq_tilt", "led_gamma",
-                    "atk_c", "rel_c", "atk_e", "rel_e", "time_gamma",
-                    "jitter_on", "jitter_thresh", "jitter_amount", "dmx_smooth_on", "smooth_size",
-                    "glitch_digi_amt", "glitch_digi_block", "glitch_ana_amt", "glitch_ana_tear", "glitch_ana_noise",
-                    "od_thresh", "od_desat", "od_glitch", "link_all_dynamics"
-                ]
-                filtered_params = {k: v for k, v in new_params.items() if k in preset_whitelist}
+                filtered_params = {k: v for k, v in new_params.items() if k in self.PRESET_WHITELIST}
 
                 # --- NEW: Merge the preset into the master memory BEFORE updating the GUI ---
                 self.params.update(filtered_params)

@@ -5,6 +5,39 @@ All notable changes to Titan Engine are documented here. Format follows
 
 ## [Unreleased]
 
+### [2026-04-18] - Deduplicate preset whitelist, packet send, and PD RMS envelope
+
+#### Changed
+- **Preset whitelist consolidated.** The 8-line list of effect-preset
+  param keys lived twice in `titan_gui.py` (once in `save_preset`, once
+  in `load_preset`). Promoted to a class constant
+  `TitanQtGUI.PRESET_WHITELIST` (tuple). Both call sites now reference
+  it. Adding/removing a preset key is now a one-place edit and the two
+  paths can never drift.
+- **`sender_thread` packet build/send extracted.** `main_v5.01.py` now
+  has a `_send_universe(out_u, payload, dest_ip, ...)` helper that
+  encapsulates protocol selection (sACN sequence increment + builder vs.
+  Art-Net builder), the `socket.sendto`, and the success/error return.
+  The two near-identical 12-line blocks in `sender_thread` (main loop
+  and feedback universe) collapsed to 4 and 3 lines respectively. No
+  behavior change — counters and warnings still happen at the call site
+  because they differ between the main and feedback paths.
+- **`audio_input.pd`: three inline copies of `custom_env` extracted into
+  a `custom_env.pd` abstraction file.** Each copy was a 19-line
+  inlet/`*~`/`lop~`/`snapshot~`/`sqrt`/`rmstodb`/outlet chain — the
+  RMS-to-dB envelope detector used for the three audio bands (full,
+  low-pass, high-pass). Replaced each with a single `[custom_env]`
+  object. Object indices in the parent canvas are preserved (`#X
+  restore` and `#X obj <abstraction>` both consume one slot), so all
+  existing `#X connect` lines remain valid.
+
+#### Removed
+- ~57 lines of duplicate Pd code, ~12 lines of duplicate Python preset
+  whitelist, ~14 lines of duplicate Python packet build/send logic.
+  CLAUDE.md refactor targets #24, #25, #26 closed.
+
+---
+
 ### [2026-04-18] - Bare-except cleanup
 
 #### Changed
