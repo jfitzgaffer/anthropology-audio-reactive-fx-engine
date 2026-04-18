@@ -79,8 +79,6 @@ Lighting console ──Art-Net→ UDP 6454 ──→ artnet_listener_thread ─�
 
 ### HIGH
 
-7. **Silent `except: pass` everywhere.** Swallows corrupted default files, bad JSON, permission errors, save failures. Locations include `main_v5.01.py:184`, `titan_gui.py:783, 854, 1434, 1510, 1602, 1932`. At minimum, log the exception.
-
 8. **Thread-safety: none.** `handle_audio` on the OSC thread writes `engine.dmx_buffers` and `engine.scope_*` while the Qt thread reads them at 30 Hz in `refresh_logic`. GIL keeps it mostly OK but `deque`→`list(…)` can observe a half-updated deque. Add a `threading.Lock` around the buffer swap, or double-buffer.
 
 9. **Audio processing runs on the OSC receive thread.** All DSP + all network sends happen inside `handle_audio`. Any `sendto()` stall blocks audio intake. Move network output to its own thread with a single-slot queue (latest frame wins).

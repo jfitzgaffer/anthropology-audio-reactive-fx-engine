@@ -5,6 +5,31 @@ All notable changes to Titan Engine are documented here. Format follows
 
 ## [Unreleased]
 
+### [2026-04-18] - Bare-except cleanup
+
+#### Changed
+- **`titan_gui.py:993` and `titan_gui.py:1943`**: narrowed bare `except:`
+  to `except TypeError:`. Both were the same QSpinBox fallback pattern
+  (try `setValue(float(val))`, fall back to `setValue(int(val))` for
+  integer-only spinboxes). Narrowing means any non-TypeError — a
+  widget-lifetime bug, a C++ deletion, a value-out-of-range — will now
+  surface instead of being silently swallowed. Other sibling blocks in
+  the same file (lines 1659, 1725, 1748, 2285) already used
+  `except TypeError:`, so this just brings the two stragglers in line.
+
+- **`CLAUDE.md` Known Bugs → HIGH #7** removed. The "silent `except: pass`
+  everywhere" bug pointed at line numbers that have since been
+  refactored (e.g. `main_v5.01.py:184` is now in a dict literal, and
+  the titan_gui.py line numbers all now contain unrelated code). A
+  full repo audit confirms no remaining silent swallowers:
+  - all `except Exception` blocks log via `logger.error/warning/exception`
+  - `queue.Full` / `queue.Empty` `pass` branches in `handle_audio` are
+    the intentional latest-frame-wins single-slot-queue idiom
+  - type-coercion helpers (`_coerce_dev_id`, `_parse_pd_device_list`)
+    correctly swallow `TypeError`/`ValueError` as a control-flow tool
+
+---
+
 ### [2026-04-18] - Remote-Control status honors GUI lock; CLAUDE.md CRITICAL cleared
 
 #### Fixed

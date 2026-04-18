@@ -990,7 +990,7 @@ class TitanQtGUI(QObject):
                             spin.blockSignals(True)
                             try:
                                 spin.setValue(float(val))
-                            except:
+                            except TypeError:
                                 spin.setValue(int(val))
                             spin.blockSignals(False)
                         elif chk:
@@ -1940,7 +1940,7 @@ class TitanQtGUI(QObject):
                 spin.blockSignals(True)
                 try:
                     spin.setValue(val)
-                except:
+                except TypeError:
                     spin.setValue(int(val))
                 spin.blockSignals(False)
             if sld:
