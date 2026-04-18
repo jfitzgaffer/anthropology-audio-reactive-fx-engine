@@ -5,6 +5,44 @@ All notable changes to Titan Engine are documented here. Format follows
 
 ## [Unreleased]
 
+### [2026-04-18] - Fixture preview strip, ArtPoll network discovery, web remote UI
+
+#### Added
+- **Fixture preview strip.** A horizontal row of color swatches above the
+  DMX grid (`titan_gui.py::_setup_fixture_preview`), one box per active
+  fixture. Each box shows the fixture's name, universe, and a live
+  RGBW-blended color rectangle driven by the actual DMX output bytes.
+  Updates at 30 Hz in `refresh_logic` via `_refresh_fixture_preview`.
+  Rebuilds automatically whenever `rebuild_dmx_grid` runs (patch change,
+  mode change, column resize). Dark when output is < 4 per channel.
+
+- **ArtPoll network discovery.** "Network Discovery (ArtPoll)" group box
+  added to the Network tab (`titan_gui.py::_setup_artpoll_ui`). "Scan
+  Network" button broadcasts a 14-byte ArtPoll packet to
+  255.255.255.255:6454, collects ArtPollReply packets for 3 seconds in a
+  daemon thread, and populates a 3-column table (IP, Short Name, Long
+  Name). Scan runs off the Qt thread; results land in
+  `app_state["discovered_nodes"]` and are consumed by
+  `_update_artpoll_table` in the next `refresh_logic` tick.
+  `artpoll_scan(timeout)` in `main_v5.01.py` is exposed via callbacks.
+
+- **Web remote-control UI.** Minimal HTTP server started at boot
+  (`main_v5.01.py::start_web_server`, stdlib `http.server` +
+  `socketserver.ThreadingTCPServer`, no new dependencies). Default port
+  9000 (configurable via `params["web_port"]`). Serves a dark mobile-
+  responsive single-page app at `/`. API:
+  - `GET /api/state` — JSON with mute, panic, dimmer, FPS, audio status,
+    Art-Net packet count, preset map.
+  - `POST /api/command` — JSON body `{cmd, value}`. Commands:
+    `mute` (0/1), `panic` (true/false), `dimmer` (0-255),
+    `preset` (slot 1-10).
+  Page polls `/api/state` every 500 ms and reflects live state.
+  Preset buttons glow green when a preset file is mapped to that slot.
+  The server's LAN IP and port appear in the Status box "Web Remote:" row
+  and are logged at startup. Also readable by copying from the GUI.
+
+---
+
 ### [2026-04-18] - Decouple DSP from OSC receive thread (compute_audio_thread)
 
 #### Changed

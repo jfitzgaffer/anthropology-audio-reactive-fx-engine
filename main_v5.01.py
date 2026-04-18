@@ -33,6 +33,8 @@ import json
 import signal
 import logging
 import queue
+import http.server
+import socketserver
 
 from pythonosc import dispatcher, osc_server, udp_client
 from PySide6.QtWidgets import QApplication
@@ -129,6 +131,8 @@ params = {
     # Persisted Pure Data audio output device ID. Needed for BlackHole-input
     # rigs so PD doesn't accidentally output back into the loopback.
     "pd_audio_dev_out": None,
+    # Web remote-control server port (default 9000).
+    "web_port": 9000,
 }
 
 params["num_fixtures"] = 1
@@ -209,6 +213,10 @@ app_state = {
     # Tracks (offset, universe) pairs we've already warned about so the
     # offset-collision log doesn't spam every audio frame.
     "offset_warned": set(),
+    # ArtPoll discovery results. None = scan in progress, [] = scan done (consumed), list = new results.
+    "discovered_nodes": [],
+    # Web remote server address (set by start_web_server after bind succeeds).
+    "web_ip": None, "web_port": None,
     # Panic Blackout flag. Toggled by the GUI's PANIC BLACKOUT button.
     # When True, sender_thread overwrites every outgoing payload with zeros
     # so fixtures actively go dark — we can't just halt transmission because
@@ -247,6 +255,225 @@ def _dest_ip_for(u, net_mode, is_sacn, base_ip):
     if net_mode == "Multicast" and is_sacn:
         return f"239.255.{(u >> 8) & 0xFF}.{u & 0xFF}"
     return base_ip
+
+
+def artpoll_scan(timeout=3.0):
+    """Broadcast ArtPoll and collect ArtPollReply packets for `timeout` seconds.
+    Returns list of dicts: {"ip", "short_name", "long_name"}."""
+    ARTPOLL = (
+        b'Art-Net\x00'  # ID
+        b'\x00\x20'     # OpPoll LE = 0x2000
+        b'\x00\x0e'     # Protocol version 14
+        b'\x02'         # TalkToMe: unicast replies
+        b'\x00'         # Priority: dp_low
+    )
+    results = []
+    seen_ips = set()
+    scan_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        scan_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        scan_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        scan_sock.settimeout(0.3)
+        scan_sock.bind(("", 0))
+        scan_sock.sendto(ARTPOLL, ("255.255.255.255", 6454))
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                data, (ip, _) = scan_sock.recvfrom(1024)
+                if len(data) < 108 or data[:8] != b'Art-Net\x00':
+                    continue
+                if (data[8] | (data[9] << 8)) != 0x2100:  # OpPollReply
+                    continue
+                if ip in seen_ips:
+                    continue
+                seen_ips.add(ip)
+                short = data[26:44].split(b'\x00')[0].decode('utf-8', errors='replace').strip()
+                long_ = data[44:108].split(b'\x00')[0].decode('utf-8', errors='replace').strip()
+                results.append({"ip": ip, "short_name": short, "long_name": long_})
+            except socket.timeout:
+                pass
+    except Exception as e:
+        logger.warning(f"ArtPoll scan error: {e}")
+    finally:
+        scan_sock.close()
+    logger.info(f"ArtPoll scan complete: {len(results)} node(s) found")
+    return results
+
+
+_WEB_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>Titan Engine Remote</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#111;color:#eee;font-family:-apple-system,BlinkMacSystemFont,sans-serif;padding:16px;max-width:600px;margin:0 auto}
+h1{font-size:20px;margin-bottom:16px;color:#aaa;text-align:center;letter-spacing:2px}
+h2{font-size:12px;color:#555;margin:18px 0 8px;text-transform:uppercase;letter-spacing:1px}
+.status{background:#1a1a1a;border-radius:8px;padding:12px;margin-bottom:12px}
+.row{display:flex;justify-content:space-between;padding:3px 0;font-size:13px}
+.val{font-family:monospace}
+.green{color:#0f0}.yellow{color:#ff0}.red{color:#f44}.gray{color:#555}
+.btn{display:block;width:100%;padding:20px;margin:8px 0;border-radius:10px;font-size:18px;font-weight:bold;border:none;cursor:pointer;transition:opacity .1s;-webkit-tap-highlight-color:transparent}
+.btn:active{opacity:.7}
+.btn-off{background:#222;color:#ccc;border:1px solid #333}
+.btn-panic{background:#cc0000;color:#fff}
+.btn-restore{background:#ff8800;color:#fff}
+.btn-mute{background:#333;color:#ff8c00;border:1px solid #ff8c00}
+.btn-muted{background:#ff8c00;color:#111}
+.range-wrap{margin:8px 0}
+.range-wrap label{font-size:13px;color:#aaa;display:flex;justify-content:space-between}
+input[type=range]{width:100%;height:44px;accent-color:#0f0;cursor:pointer}
+.presets{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin:8px 0}
+.pbtn{padding:14px 0;border-radius:6px;background:#1a1a1a;color:#555;border:1px solid #2a2a2a;font-size:13px;cursor:pointer;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;-webkit-tap-highlight-color:transparent}
+.pbtn.live{background:#1a2a1a;color:#6f6;border-color:#3a5a3a}
+.pbtn:active{opacity:.7}
+</style>
+</head>
+<body>
+<h1>&#9889; TITAN ENGINE</h1>
+<div class="status">
+  <div class="row"><span>Audio</span><span class="val" id="s-audio">&#x2014;</span></div>
+  <div class="row"><span>FPS</span><span class="val" id="s-fps">&#x2014;</span></div>
+  <div class="row"><span>Art-Net</span><span class="val" id="s-pkts">&#x2014;</span></div>
+</div>
+<button id="btn-panic" class="btn btn-off" onclick="sendCmd('panic',!panic)">PANIC BLACKOUT</button>
+<button id="btn-mute" class="btn btn-mute" onclick="sendCmd('mute',!mute)">MUTE</button>
+<h2>Master Dimmer</h2>
+<div class="range-wrap">
+  <label><span>Level</span><span id="dv">255</span></label>
+  <input type="range" id="sld" min="0" max="255" value="255"
+    oninput="document.getElementById('dv').textContent=this.value"
+    onchange="sendCmd('dimmer',+this.value)">
+</div>
+<h2>Presets</h2>
+<div class="presets" id="pgrid"></div>
+<script>
+var panic=false,mute=false;
+function sendCmd(cmd,val){
+  fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd:cmd,value:val})})
+  .then(r=>r.json()).then(apply);
+}
+function apply(s){
+  panic=!!s.panic; mute=s.mute>0;
+  var pb=document.getElementById('btn-panic');
+  pb.className='btn '+(panic?'btn-restore':'btn-panic');
+  pb.textContent=panic?'CLICK TO RESTORE':'PANIC BLACKOUT';
+  var mb=document.getElementById('btn-mute');
+  mb.className='btn '+(mute?'btn-muted':'btn-mute');
+  mb.textContent=mute?'MUTED \u2014 TAP TO RESTORE':'MUTE';
+  var ael=document.getElementById('s-audio');
+  ael.textContent=s.audio_status||'\u2014';
+  ael.className='val '+(s.audio_ok?'green':'red');
+  document.getElementById('s-fps').textContent=(+s.fps||0).toFixed(1)+' Hz';
+  var pa=s.art_packets||0;
+  var pke=document.getElementById('s-pkts');
+  pke.textContent=s.artnet_active?(pa+' pkts'):'OFF';
+  pke.className='val '+(s.artnet_active&&pa>0?'green':'red');
+  var d=Math.round((+s.dimmer||1)*255);
+  document.getElementById('sld').value=d;
+  document.getElementById('dv').textContent=d;
+  var pg=document.getElementById('pgrid');
+  var html='';
+  for(var i=1;i<=10;i++){
+    var nm=s.presets&&s.presets[i]?s.presets[i].replace(/.*[\\\\/]/,'').replace('.json',''):i;
+    var cls=s.presets&&s.presets[i]?' live':'';
+    html+='<div class="pbtn'+cls+'" onclick="sendCmd(\'preset\','+i+')">'+nm+'</div>';
+  }
+  pg.innerHTML=html;
+}
+function poll(){fetch('/api/state').then(r=>r.json()).then(apply).catch(function(){});}
+poll(); setInterval(poll,500);
+</script>
+</body>
+</html>"""
+
+
+def start_web_server(port=9000):
+    """Start a minimal HTTP remote-control server. No external deps — stdlib only."""
+    def _make_handler(params, app_state, notify_pd):
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args): pass  # suppress per-request stdout noise
+
+            def do_GET(self):
+                if self.path in ('/', '/index.html'):
+                    self._html(_WEB_HTML)
+                elif self.path == '/api/state':
+                    self._json(self._state())
+                else:
+                    self.send_response(404); self.end_headers()
+
+            def do_POST(self):
+                if self.path == '/api/command':
+                    n = int(self.headers.get('Content-Length', 0))
+                    body = json.loads(self.rfile.read(n))
+                    self._handle(body)
+                    self._json(self._state())
+                else:
+                    self.send_response(404); self.end_headers()
+
+            def _html(self, text):
+                data = text.encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.send_header('Content-Length', len(data))
+                self.end_headers(); self.wfile.write(data)
+
+            def _json(self, obj):
+                data = json.dumps(obj).encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', len(data))
+                self.end_headers(); self.wfile.write(data)
+
+            def _state(self):
+                pm = app_state.get("preset_map", {})
+                audio_ok = (time.time() - app_state.get("pd_last_time", 0)) < 0.5
+                return {
+                    "mute": int(params.get("mute", 0)),
+                    "panic": bool(app_state.get("panic_blackout", False)),
+                    "dimmer": float(params.get("master_inhibitive", 1.0)),
+                    "fps": float(app_state.get("current_fps", 0.0)),
+                    "audio_status": app_state.get("osc_in_text", "\u2014"),
+                    "audio_ok": audio_ok,
+                    "art_packets": int(app_state.get("art_packets", 0)),
+                    "artnet_active": bool(app_state.get("artnet_active", False)),
+                    "presets": {int(k): str(v) for k, v in pm.items()},
+                }
+
+            def _handle(self, body):
+                cmd, val = body.get("cmd"), body.get("value")
+                if cmd == "mute":
+                    params["mute"] = 1 if val else 0
+                    notify_pd("/mute", int(bool(val)))
+                elif cmd == "panic":
+                    app_state["panic_blackout"] = bool(val)
+                elif cmd == "dimmer":
+                    params["master_inhibitive"] = max(0.0, min(1.0, int(val) / 255.0))
+                elif cmd == "preset":
+                    f = app_state.get("preset_map", {}).get(int(val))
+                    if f:
+                        app_state["pending_preset"] = f
+        return _Handler
+
+    class _Server(socketserver.ThreadingTCPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+
+    def _run():
+        handler = _make_handler(params, app_state, notify_pd)
+        try:
+            with _Server(("", port), handler) as httpd:
+                local_ip = get_local_ip()
+                logger.info(f"Web remote UI: http://{local_ip}:{port}  (also http://localhost:{port})")
+                app_state["web_port"] = port
+                app_state["web_ip"] = local_ip
+                httpd.serve_forever()
+        except OSError as e:
+            logger.warning(f"Web server could not start on port {port}: {e}")
+
+    threading.Thread(target=_run, daemon=True, name="WebServer").start()
 
 
 def _send_universe(out_u, payload, dest_ip, target_port, is_sacn, *,
@@ -731,17 +958,17 @@ if __name__ == "__main__":
     dmx_sender_thread = threading.Thread(target=sender_thread, daemon=True, name="DMXSender")
     dmx_sender_thread.start()
 
+    web_port = int(params.get("web_port", 9000))
+    start_web_server(port=web_port)
+
     callbacks = {
         "send_osc": notify_pd,
         "toggle_artnet": toggle_artnet,
         "toggle_remote": toggle_remote,
         "update_ctrl_cache": update_ctrl_cache,
-        # The GUI's Audio tab uses this to populate the device dropdown and
-        # to relaunch PD when the user picks a different interface.
         "watchdog": watchdog,
-        # Called after any PD relaunch (device change) to re-sync filter,
-        # oscillator, and mute state from `params` into the fresh PD process.
         "push_pd_init": push_pd_init_params,
+        "artpoll_scan": artpoll_scan,
     }
     gui = TitanQtGUI(params, slider_cfg, engine, app_state, callbacks)
 

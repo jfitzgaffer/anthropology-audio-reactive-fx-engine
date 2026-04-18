@@ -2,6 +2,7 @@ import sys
 import json
 import time
 import os
+import threading
 import pyqtgraph as pg
 import logging
 from PySide6.QtWidgets import (QApplication, QVBoxLayout, QGridLayout, QFrame, QFileDialog,
@@ -18,16 +19,21 @@ from titan_widgets import DMXGridOverlay, FixturePatchWidget
 logger = logging.getLogger("TitanEngine")
 
 
-class QtLogHandler(logging.Handler, QObject):
+# Change the order so QObject is first
+class QtLogHandler(QObject, logging.Handler):
     new_log = Signal(str)
 
     def __init__(self):
-        logging.Handler.__init__(self)
+        # Initialize them in the correct order
         QObject.__init__(self)
+        logging.Handler.__init__(self)
 
     def emit(self, record):
-        msg = self.format(record)
-        self.new_log.emit(msg)
+        try:
+            msg = self.format(record)
+            self.new_log.emit(msg)
+        except Exception:
+            self.handleError(record)
 
 
 class DebugWindow(QWidget):
@@ -124,7 +130,9 @@ class TitanQtGUI(QObject):
         self._setup_menubar()
         self._setup_scope()
         self._setup_dmx_grid()
+        self._setup_fixture_preview()
         self._setup_protocol_ui()
+        self._setup_artpoll_ui()
         self._setup_dynamic_patch()
         self._setup_color_mixer()
         self._setup_bg_color_mixer()
@@ -1154,7 +1162,138 @@ class TitanQtGUI(QObject):
         if hasattr(self.dmx_grid_widget, 'parentWidget') and self.dmx_grid_widget.parentWidget():
             self.dmx_grid_widget.parentWidget().updateGeometry()
 
+        self.rebuild_fixture_preview()
         self._update_dmx_overlay()
+
+    def _setup_fixture_preview(self):
+        """Horizontal strip of one color-box per active fixture above the DMX grid."""
+        container = QWidget()
+        container.setFixedHeight(68)
+        h = QHBoxLayout(container)
+        h.setContentsMargins(4, 4, 4, 4)
+        h.setSpacing(4)
+        h.setAlignment(Qt.AlignLeft)
+        self._fix_prev_container = container
+        self._fix_prev_layout = h
+        self._fix_prev_boxes = {}  # {f_num: QLabel color swatch}
+        parent_layout = self.ui.dmx_scroll.parentWidget().layout()
+        parent_layout.insertWidget(0, container)
+        self.rebuild_fixture_preview()
+
+    def rebuild_fixture_preview(self):
+        if not hasattr(self, '_fix_prev_layout'):
+            return
+        while self._fix_prev_layout.count():
+            item = self._fix_prev_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._fix_prev_boxes.clear()
+        n = int(self.params.get("num_fixtures", 1))
+        for f in range(1, n + 1):
+            if not self.params.get(f"f{f}_active"):
+                continue
+            name = self.params.get(f"f{f}_name", f"Fix {f}")
+            uni = self.params.get(f"f{f}_uni", 0)
+            box = QWidget()
+            box.setFixedWidth(72)
+            vl = QVBoxLayout(box)
+            vl.setContentsMargins(2, 2, 2, 2)
+            vl.setSpacing(2)
+            lbl_name = QLabel(name[:9])
+            lbl_name.setAlignment(Qt.AlignCenter)
+            lbl_name.setStyleSheet("color: #777; font-size: 9px;")
+            lbl_name.setFixedHeight(12)
+            lbl_uni = QLabel(f"U{uni}")
+            lbl_uni.setAlignment(Qt.AlignCenter)
+            lbl_uni.setStyleSheet("color: #555; font-size: 9px;")
+            lbl_uni.setFixedHeight(10)
+            lbl_color = QLabel()
+            lbl_color.setStyleSheet("background: #111; border: 1px solid #2a2a2a; border-radius: 3px;")
+            vl.addWidget(lbl_name)
+            vl.addWidget(lbl_uni)
+            vl.addWidget(lbl_color, 1)
+            self._fix_prev_layout.addWidget(box)
+            self._fix_prev_boxes[f] = lbl_color
+        self._fix_prev_layout.addStretch()
+
+    def _refresh_fixture_preview(self, snap_buffers):
+        if not hasattr(self, '_fix_prev_boxes'):
+            return
+        for f, lbl in self._fix_prev_boxes.items():
+            uni = self.params.get(f"f{f}_uni", 0)
+            addr = self.params.get(f"f{f}_addr", 1) - 1
+            foot = self.params.get(f"f{f}_foot", 4)
+            buf = snap_buffers.get(uni)
+            if buf is None or addr < 0 or addr + max(foot, 1) > 512:
+                lbl.setStyleSheet("background: #111; border: 1px solid #2a2a2a; border-radius: 3px;")
+                continue
+            r = buf[addr] if foot >= 1 else 0
+            g = buf[addr + 1] if foot >= 2 else 0
+            b = buf[addr + 2] if foot >= 3 else 0
+            w = buf[addr + 3] if foot >= 4 else 0
+            sr, sg, sb = min(255, r + w), min(255, g + w), min(255, b + w)
+            if max(sr, sg, sb) < 4:
+                lbl.setStyleSheet("background: #111; border: 1px solid #2a2a2a; border-radius: 3px;")
+            else:
+                lbl.setStyleSheet(f"background: rgb({sr},{sg},{sb}); border-radius: 3px;")
+
+    def _setup_artpoll_ui(self):
+        """Network discovery section appended to the Network Output Settings group."""
+        box = QGroupBox("Network Discovery (ArtPoll)")
+        box.setStyleSheet("QGroupBox { font-weight: bold; }")
+        vl = QVBoxLayout(box)
+        btn_row = QWidget()
+        bl = QHBoxLayout(btn_row)
+        bl.setContentsMargins(0, 0, 0, 0)
+        self._btn_artpoll = QPushButton("Scan Network")
+        self._btn_artpoll.clicked.connect(self._start_artpoll_scan)
+        self._lbl_artpoll_status = QLabel("Press Scan to discover Art-Net nodes on this subnet.")
+        self._lbl_artpoll_status.setStyleSheet("color: #888; font-size: 11px;")
+        bl.addWidget(self._btn_artpoll)
+        bl.addWidget(self._lbl_artpoll_status, 1)
+        self._tbl_nodes = QTableWidget(0, 3)
+        self._tbl_nodes.setHorizontalHeaderLabels(["IP", "Short Name", "Long Name"])
+        self._tbl_nodes.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._tbl_nodes.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._tbl_nodes.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._tbl_nodes.setFixedHeight(120)
+        self._tbl_nodes.setStyleSheet("font-size: 11px;")
+        vl.addWidget(btn_row)
+        vl.addWidget(self._tbl_nodes)
+        if self.ui.groupBox_6.layout():
+            self.ui.groupBox_6.layout().addWidget(box)
+
+    def _start_artpoll_scan(self):
+        scan_fn = self.callbacks.get("artpoll_scan")
+        if not scan_fn:
+            return
+        self._btn_artpoll.setEnabled(False)
+        self._lbl_artpoll_status.setText("Scanning… (3 s)")
+        self.app_state["discovered_nodes"] = None  # sentinel: scan in progress
+
+        def _run():
+            results = scan_fn(timeout=3.0)
+            self.app_state["discovered_nodes"] = results
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _update_artpoll_table(self):
+        nodes = self.app_state.get("discovered_nodes")
+        if nodes is None:
+            return  # scan still running
+        self._btn_artpoll.setEnabled(True)
+        self._tbl_nodes.setRowCount(0)
+        if not nodes:
+            self._lbl_artpoll_status.setText("No Art-Net nodes found.")
+            return
+        self._lbl_artpoll_status.setText(f"{len(nodes)} node(s) found.")
+        for node in nodes:
+            r = self._tbl_nodes.rowCount()
+            self._tbl_nodes.insertRow(r)
+            self._tbl_nodes.setItem(r, 0, QTableWidgetItem(node.get("ip", "")))
+            self._tbl_nodes.setItem(r, 1, QTableWidgetItem(node.get("short_name", "")))
+            self._tbl_nodes.setItem(r, 2, QTableWidgetItem(node.get("long_name", "")))
+        self.app_state["discovered_nodes"] = []  # clear so we don't re-render next frame
 
     def _update_dmx_overlay(self):
         if hasattr(self.dmx_grid_widget, "active_zones"):
@@ -1403,6 +1542,14 @@ class TitanQtGUI(QObject):
         row_buf.addWidget(QLabel("Audio Buffer:"))
         row_buf.addWidget(self.lbl_stat_buf)
         l.addLayout(row_buf)
+
+        row_web = QHBoxLayout()
+        self.lbl_stat_web = QLabel("starting…")
+        self.lbl_stat_web.setStyleSheet("color: #5588ff; font-size: 11px;")
+        self.lbl_stat_web.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        row_web.addWidget(QLabel("Web Remote:"))
+        row_web.addWidget(self.lbl_stat_web)
+        l.addLayout(row_web)
 
     def _setup_remote_info(self):
         box = QGroupBox("Control Universe DMX Map (Fixed)")
@@ -2112,6 +2259,12 @@ class TitanQtGUI(QObject):
 
             self.lbl_stat_buf.setText(f"{self.engine.audio_latency_ms:.1f} ms")
 
+            if hasattr(self, 'lbl_stat_web'):
+                web_ip = self.app_state.get("web_ip")
+                web_port = self.app_state.get("web_port")
+                if web_ip and web_port:
+                    self.lbl_stat_web.setText(f"http://{web_ip}:{web_port}")
+
         if self.app_state.get("pending_preset"):
             preset_file = self.app_state.get("pending_preset")
             self.app_state["pending_preset"] = None
@@ -2124,6 +2277,7 @@ class TitanQtGUI(QObject):
             self.curve_audio.setData(snap_audio)
             self.curve_center.setData(snap_center)
             self.curve_edge.setData(snap_edge)
+            self._refresh_fixture_preview(snap_buffers)
 
             if hasattr(self, 'dmx_boxes'):
                 mon_univ = self.spin_mon_univ.value()
@@ -2288,3 +2442,6 @@ class TitanQtGUI(QObject):
                                 sld.blockSignals(True)
                                 sld.setValue(target_sld)
                                 sld.blockSignals(False)
+
+        if "discovered_nodes" in self.app_state:
+            self._update_artpoll_table()
