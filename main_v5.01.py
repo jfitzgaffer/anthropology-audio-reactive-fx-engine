@@ -1,6 +1,6 @@
 import os
 import sys
-#os.environ["QT_DEBUG_PLUGINS"] = "1"
+# os.environ["QT_DEBUG_PLUGINS"] = "1"
 import subprocess
 
 # ==========================================
@@ -31,11 +31,7 @@ import time
 import json
 import signal
 import logging
-import threading
-import time
-import json
-import signal
-import logging
+import queue
 
 from pythonosc import dispatcher, osc_server, udp_client
 from PySide6.QtWidgets import QApplication
@@ -216,6 +212,84 @@ except:
 
 pd_client = udp_client.SimpleUDPClient("127.0.0.1", 5006)
 
+send_queue = queue.Queue(maxsize=1)
+
+
+def _build_artnet_packet(universe, payload, art_net_val, art_sub_val):
+    port_addr = (art_net_val << 8) | (art_sub_val << 4) | (universe & 0x0F)
+    header = bytearray(b'Art-Net\x00\x00\x50\x00\x0e\x00\x00')
+    header.append(port_addr & 0xFF)
+    header.append((port_addr >> 8) & 0x7F)
+    header.append((len(payload) >> 8) & 0xFF)
+    header.append(len(payload) & 0xFF)
+    return header + bytearray(payload)
+
+
+def _dest_ip_for(u, net_mode, is_sacn, base_ip):
+    if net_mode == "Broadcast" and not is_sacn:
+        return "255.255.255.255"
+    if net_mode == "Multicast" and is_sacn:
+        return f"239.255.{(u >> 8) & 0xFF}.{u & 0xFF}"
+    return base_ip
+
+
+def sender_thread():
+    logger.info("DMX sender thread running.")
+    while True:
+        try:
+            job = send_queue.get()
+            cfg = job["cfg"]
+            buffers = job["buffers"]
+            fb_payload = job["fb_payload"]
+
+            is_sacn = cfg["is_sacn"]
+            target_port = cfg["target_port"]
+            base_ip = cfg["base_ip"]
+            net_mode = cfg["net_mode"]
+            priority = cfg["priority"]
+            src_name = cfg["src_name"]
+            is_preview = cfg["is_preview"]
+            art_net_val = cfg["art_net_val"]
+            art_sub_val = cfg["art_sub_val"]
+            offset = cfg["offset"]
+
+            for u, payload in buffers.items():
+                dest_ip = _dest_ip_for(u, net_mode, is_sacn, base_ip)
+                out_u = max(0, u - offset)
+
+                if is_sacn:
+                    app_state["sacn_seq"][out_u] = (app_state["sacn_seq"].get(out_u, 0) + 1) % 256
+                    packet = build_sacn_packet(out_u, payload, app_state["sacn_seq"][out_u],
+                                               priority, src_name, is_preview)
+                else:
+                    packet = _build_artnet_packet(out_u, payload, art_net_val, art_sub_val)
+
+                try:
+                    net_sock.sendto(packet, (dest_ip, target_port))
+                    app_state["art_packets"] += 1
+                    app_state["send_error"] = None
+                except Exception as e:
+                    app_state["send_error"] = str(e)
+                    logger.warning(f"Network Blocked! Reason: {e} | Target IP: '{dest_ip}'")
+
+            fb_univ = 14
+            fb_dest = _dest_ip_for(fb_univ, net_mode, is_sacn, base_ip)
+            fb_univ_out = max(0, fb_univ - offset)
+            if is_sacn:
+                app_state["sacn_seq"][fb_univ_out] = (app_state["sacn_seq"].get(fb_univ_out, 0) + 1) % 256
+                fb_packet = build_sacn_packet(fb_univ_out, fb_payload, app_state["sacn_seq"][fb_univ_out],
+                                              priority, src_name, is_preview)
+            else:
+                fb_packet = _build_artnet_packet(fb_univ_out, fb_payload, art_net_val, art_sub_val)
+
+            try:
+                net_sock.sendto(fb_packet, (fb_dest, target_port))
+            except Exception as e:
+                app_state["send_error"] = str(e)
+
+        except Exception:
+            logger.exception("sender_thread error")
+
 
 def handle_audio(unused_addr, total_db, bass_db, treble_db):
     app_state["pd_last_time"] = time.time()
@@ -245,58 +319,22 @@ def handle_audio(unused_addr, total_db, bass_db, treble_db):
         app_state["packet_reset_time"] = time.time()
 
     if app_state["artnet_active"]:
-        active_univs = list(buffers.keys())
-
         protocol = params.get("protocol", "Art-Net")
-        net_mode = params.get("net_mode", "Unicast")
-        base_ip = str(params.get("art_ip", "127.0.0.1")).strip()
-
         is_sacn = protocol == "sACN"
-        target_port = 5568 if is_sacn else int(params.get("art_port", 6454))
-        priority = int(params.get("sacn_priority", 100))
-        src_name = str(params.get("sacn_src", "Titan Engine"))
-        is_preview = int(params.get("sacn_preview", 0)) == 1
-        art_net_val = int(params.get("art_net", 0))
-        art_sub_val = int(params.get("art_sub", 0))
+        cfg = {
+            "is_sacn": is_sacn,
+            "net_mode": params.get("net_mode", "Unicast"),
+            "base_ip": str(params.get("art_ip", "127.0.0.1")).strip(),
+            "target_port": 5568 if is_sacn else int(params.get("art_port", 6454)),
+            "priority": int(params.get("sacn_priority", 100)),
+            "src_name": str(params.get("sacn_src", "Titan Engine")),
+            "is_preview": int(params.get("sacn_preview", 0)) == 1,
+            "art_net_val": int(params.get("art_net", 0)),
+            "art_sub_val": int(params.get("art_sub", 0)),
+            "offset": 1 if int(params.get("artnet_offset", 1)) == 1 else 0,
+        }
 
-        def get_dest_ip(u):
-            if net_mode == "Broadcast" and not is_sacn:
-                return "255.255.255.255"
-            elif net_mode == "Multicast" and is_sacn:
-                return f"239.255.{(u >> 8) & 0xFF}.{u & 0xFF}"
-            return base_ip
-
-        offset = 1 if int(params.get("artnet_offset", 1)) == 1 else 0
-
-        for u in active_univs:
-            payload = buffers.get(u, [0] * 512)
-            dest_ip = get_dest_ip(u)
-            out_u = max(0, u - offset)
-
-            if is_sacn:
-                app_state["sacn_seq"][out_u] = (app_state["sacn_seq"].get(out_u, 0) + 1) % 256
-                packet = build_sacn_packet(out_u, payload, app_state["sacn_seq"][out_u], priority, src_name, is_preview)
-            else:
-                port_addr = (art_net_val << 8) | (art_sub_val << 4) | (out_u & 0x0F)
-                header = bytearray(b'Art-Net\x00\x00\x50\x00\x0e\x00\x00')
-                header.append(port_addr & 0xFF)
-                header.append((port_addr >> 8) & 0x7F)
-                header.append((len(payload) >> 8) & 0xFF)
-                header.append(len(payload) & 0xFF)
-                packet = header + bytearray(payload)
-
-            try:
-                net_sock.sendto(packet, (dest_ip, target_port))
-                app_state["art_packets"] += 1
-                app_state["send_error"] = None
-            except Exception as e:
-                app_state["send_error"] = str(e)
-                logger.warning(f"Network Blocked! Reason: {e} | Target IP: '{dest_ip}'")
-                pass
-
-        fb_univ = 14
         fb_payload = [0] * 512
-
         fb_payload[0] = int(float(params.get("master_inhibitive", 1.0)) * 255)
         fb_payload[1] = int(params.get("color_r", 255.0))
         fb_payload[2] = int(params.get("color_g", 255.0))
@@ -341,27 +379,19 @@ def handle_audio(unused_addr, total_db, bass_db, treble_db):
                 fb_payload[base_ch + 12] = int(params.get(f"f{fix_num}_bg_w", params.get("bg_w", 0.0)))
 
         fb_payload[510] = 0  # (Previously Base Mix)
-        dest_ip_fb = get_dest_ip(fb_univ)
-        fb_univ_out = max(0, fb_univ - offset)
 
-        if is_sacn:
-            app_state["sacn_seq"][fb_univ_out] = (app_state["sacn_seq"].get(fb_univ_out, 0) + 1) % 256
-            fb_packet = build_sacn_packet(fb_univ_out, fb_payload, app_state["sacn_seq"][fb_univ_out], priority,
-                                          src_name, is_preview)
-        else:
-            port_addr_fb = (art_net_val << 8) | (art_sub_val << 4) | (fb_univ_out & 0x0F)
-            fb_header = bytearray(b'Art-Net\x00\x00\x50\x00\x0e\x00\x00')
-            fb_header.append(port_addr_fb & 0xFF)
-            fb_header.append((port_addr_fb >> 8) & 0x7F)
-            fb_header.append((len(fb_payload) >> 8) & 0xFF)
-            fb_header.append(len(fb_payload) & 0xFF)
-            fb_packet = fb_header + bytearray(fb_payload)
-
+        job = {"buffers": buffers, "fb_payload": fb_payload, "cfg": cfg}
         try:
-            net_sock.sendto(fb_packet, (dest_ip_fb, target_port))
-        except Exception as e:
-            app_state["send_error"] = str(e)
-            pass
+            send_queue.put_nowait(job)
+        except queue.Full:
+            try:
+                send_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                send_queue.put_nowait(job)
+            except queue.Full:
+                pass
 
 
 def get_preset_slot(val):
@@ -522,6 +552,7 @@ def toggle_artnet():
     status = "ON" if app_state["artnet_active"] else "OFF"
     logger.info(f"Network Output toggled {status}")
 
+
 def toggle_remote():
     params["remote_on"] = 0 if int(params.get("remote_on", 1)) == 1 else 1
     status = "ENABLED" if params["remote_on"] else "DISABLED"
@@ -532,14 +563,12 @@ def update_ctrl_cache(ch, val):
     if len(app_state["last_ctrl_dmx"]) > ch: app_state["last_ctrl_dmx"][ch] = int(val)
 
 
-
 def cleanup_pd():
     logger.info("Shutting down Titan Brain...")
     if sys.platform == "win32":
         os.system("taskkill /F /IM pd.exe 2>nul")
     else:
-        os.system("killall -9 pd 2>/dev/null")
-        os.system("killall -9 Pd 2>/dev/null")
+        os.system("pkill -9 -f audio_input.pd 2>/dev/null")
     logger.info("Shutdown complete. See you next time!")
     os._exit(0)  # <--- THIS IS CRITICAL
 
@@ -559,8 +588,7 @@ if __name__ == "__main__":
     if sys.platform == "win32":
         os.system("taskkill /F /IM pd.exe 2>nul")
     else:
-        os.system("killall -9 pd 2>/dev/null")
-        os.system("killall -9 Pd 2>/dev/null")
+        os.system("pkill -9 -f audio_input.pd 2>/dev/null")
 
     time.sleep(0.5)
 
@@ -605,7 +633,11 @@ if __name__ == "__main__":
     artnet_ctrl_thread = threading.Thread(target=artnet_listener_thread, daemon=True)
     artnet_ctrl_thread.start()
 
-    callbacks = {"send_osc": notify_pd, "toggle_artnet": toggle_artnet, "toggle_remote": toggle_remote, "update_ctrl_cache": update_ctrl_cache}
+    dmx_sender_thread = threading.Thread(target=sender_thread, daemon=True, name="DMXSender")
+    dmx_sender_thread.start()
+
+    callbacks = {"send_osc": notify_pd, "toggle_artnet": toggle_artnet, "toggle_remote": toggle_remote,
+                 "update_ctrl_cache": update_ctrl_cache}
     gui = TitanQtGUI(params, slider_cfg, engine, app_state, callbacks)
 
     for p in ["hip", "lop", "env", "test_freq", "test_db", "test_on", "sweep_on", "input_trim", "mute"]:

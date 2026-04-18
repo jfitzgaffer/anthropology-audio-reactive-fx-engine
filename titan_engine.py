@@ -1,5 +1,6 @@
 import time
 import random
+import threading
 from collections import deque
 
 
@@ -25,7 +26,15 @@ class RenderEngine:
         self.scope_center = deque([0.0] * 200, maxlen=200)
         self.scope_edge = deque([0.0] * 200, maxlen=200)
 
+        self.buf_lock = threading.Lock()
+        self.published_buffers = {}
+        self.published_scopes = ([0.0] * 200, [0.0] * 200, [0.0] * 200)
+
         self.preset_mask_time = 0.0
+
+    def get_snapshot(self):
+        with self.buf_lock:
+            return self.published_buffers, self.published_scopes
 
     def _ensure_fixture_capacity(self, count):
         while len(self.fix_state) < count:
@@ -122,10 +131,13 @@ class RenderEngine:
                 chain_info[info["f_idx"]] = {"start": curr_start, "total": total_p}
                 curr_start += info["p_count"]
 
+        first_active_idx = None
         for f_idx in range(num_fixtures):
             fix_num = f_idx + 1
             if int(params.get(f"f{fix_num}_active", 0)) == 0:
                 continue
+            if first_active_idx is None:
+                first_active_idx = f_idx
 
             p_count = min(int(params.get(f"f{fix_num}_pix", 16)), self.max_pixels_per_fix)
             p_foot = int(params.get(f"f{fix_num}_foot", 4))
@@ -326,7 +338,7 @@ class RenderEngine:
 
                 pixel_hotness = od_factor * (final_val / 255.0) * od_desat
 
-                if f_idx == 0:
+                if f_idx == first_active_idx:
                     if i == int(p_count / 2): self.scope_center.append(final_val / 255.0)
                     if i == 0: self.scope_edge.append(final_val / 255.0)
 
@@ -358,4 +370,12 @@ class RenderEngine:
         self.audio_latency_ms = pd_buffer_ms
         self.dsp_latency_ms = (time.perf_counter() - t_start) * 1000.0
 
-        return self.dmx_buffers
+        with self.buf_lock:
+            self.published_buffers = {u: bytes(b) for u, b in self.dmx_buffers.items()}
+            self.published_scopes = (
+                list(self.scope_audio),
+                list(self.scope_center),
+                list(self.scope_edge),
+            )
+
+        return self.published_buffers
