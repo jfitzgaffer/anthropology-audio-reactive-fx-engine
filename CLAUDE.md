@@ -77,12 +77,6 @@ Lighting console ──Art-Net→ UDP 6454 ──→ artnet_listener_thread ─�
 
 ## Known bugs (fix in this order)
 
-### CRITICAL — fix first
-
-3. **`artnet_offset=1` collapses universe 0 and universe 1 to the same output.** `main_v5.01.py` line 264: `out_u = max(0, u - offset)`. If a user patches both U0 and U1, they both clamp to out_u=0. Either reject U0 in the patch UI when the offset is enabled, or surface a warning.
-
-5. **Remote-Control status lies when remote is locked.** `main_v5.01.py` `process_control_universe` writes `app_state["last_ctrl_time"] = time.time()` before checking the GUI lock. When remote is disabled the status can still display "🟢 RX (DMX)". Only update `last_ctrl_time` after the remote-enabled + lock-time guards pass.
-
 ### HIGH
 
 7. **Silent `except: pass` everywhere.** Swallows corrupted default files, bad JSON, permission errors, save failures. Locations include `main_v5.01.py:184`, `titan_gui.py:783, 854, 1434, 1510, 1602, 1932`. At minimum, log the exception.

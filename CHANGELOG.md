@@ -5,6 +5,27 @@ All notable changes to Titan Engine are documented here. Format follows
 
 ## [Unreleased]
 
+### [2026-04-18] - Remote-Control status honors GUI lock; CLAUDE.md CRITICAL cleared
+
+#### Fixed
+- **Remote-Control status no longer lies while the GUI-lock window is
+  active.** `process_control_universe` in `main_v5.01.py` was writing
+  `app_state["last_ctrl_time"] = time.time()` at the top of the function,
+  before the 1.5 s `gui_lock_time` early-return. That made the middle-
+  section status display "🟢 RX (DMX)" even when the incoming frame was
+  being ignored because the user was actively dragging a slider. Moved
+  the assignment to after the early return so the timestamp only
+  advances on frames we actually apply.
+
+#### Changed
+- **`CLAUDE.md` Known Bugs → CRITICAL section** is now empty and has been
+  removed. Bug #3 (`artnet_offset=1` U0/U1 collapse) was already fixed by
+  the `offset_warned` skip-and-log guard in `sender_thread`. Bug #5
+  (remote-control status lie) fixed in this entry. All six original
+  CRITICAL bugs are now resolved.
+
+---
+
 ### [2026-04-18] - Audio output device selection, scope legend, status-dot popup
 
 #### Added

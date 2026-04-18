@@ -466,13 +466,13 @@ def get_preset_slot(val):
 
 
 def process_control_universe(dmx):
-    app_state["last_ctrl_time"] = time.time()
     last_dmx = app_state.get("last_ctrl_dmx", [0] * 512)
 
     if time.time() - app_state.get("gui_lock_time", 0) < 1.5:
         app_state["last_ctrl_dmx"] = list(dmx)
         return
 
+    app_state["last_ctrl_time"] = time.time()
     num_fixes = int(params.get("num_fixtures", 1))
 
     if len(dmx) >= 18:
