@@ -183,3 +183,18 @@ Lighting console ──Art-Net→ UDP 6454 ──→ artnet_listener_thread ─�
 - The Art-Net and sACN packet layouts (`build_sacn_packet`, the Art-Net header bytes). These are spec-correct; refactor for deduplication, not for "cleanup".
 - The 18-channel global + 13-per-fixture control-universe mapping. Changing this breaks every QLC+ show file users have saved.
 - The `preset_ch` slot-thresholds in `get_preset_slot` (25-count buckets). Standard lighting convention; users depend on it.
+
+## CRITICAL AGENT RULES: CODE MODIFICATION
+
+* **Mandatory Self-Review:** After you edit any file, you MUST run `git diff` in the terminal to review your own changes *before* you declare the task finished.
+* **The Retention Rule:** Look specifically at the red `-` lines in your diff. If you removed classes, imports, or functions that I did not explicitly ask you to remove, you must immediately revert or fix the file to restore them.
+* **No Lazy Truncation:** Never use comments like `# ... rest of code here ...` to skip writing out the full file.
+
+## CRITICAL AGENT RULES: VERSION CONTROL & DOCUMENTATION
+
+* **The Changelog Mandate:** Before you finalize any task or execute a `git commit`, you MUST update the `CHANGELOG.md` file in the root directory. If the file does not exist, create it.
+* **Changelog Formatting:** Use the standard "Keep a Changelog" format. Create a new header for your current task using the format `### [Current Date] - Task Summary`. Categorize your specific edits under bulleted lists labeled: `Added`, `Changed`, `Fixed`, or `Removed`.
+* **Print the Changelog Entry in Chat:** Every time you update `CHANGELOG.md`, also print the new entry verbatim as plaintext in your chat response so I can read it without opening the file. Print only the entry you just added, not the entire changelog history.
+* **Pre-Commit Analysis:** You must run `git diff --cached` (or `git diff` if unstaged) to mathematically analyze your exact changes before writing your commit message.
+* **Exhaustive Commit Messages:** When you run `git commit`, you must use the `-m` flag to generate a comprehensive, multi-line commit message. The first line must be a concise summary. The following lines must be a detailed bulleted list of every feature, fix, and architectural shift you just analyzed in the diff.
+* **Mandatory Testing Protocol:** After completing a task and committing the code, you MUST provide me with a clear, step-by-step guide on how to manually test your changes. Specify exactly which GUI elements to click, which sliders to move, or which terminal outputs/DMX channels to monitor to verify the new logic behaves perfectly.
