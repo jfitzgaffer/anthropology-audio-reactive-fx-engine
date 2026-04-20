@@ -39,6 +39,7 @@ from PySide6.QtWidgets import QApplication
 from titan_engine import RenderEngine
 from titan_gui import TitanQtGUI
 from titan_watchdog import TitanWatchdog
+from titan_calibration import AudioCalibrator
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -217,6 +218,7 @@ app_state = {
 }
 
 engine = RenderEngine()
+calibrator = AudioCalibrator(params)
 net_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 net_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 net_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -323,6 +325,11 @@ def sender_thread():
 
 def handle_audio(unused_addr, total_db, bass_db, treble_db):
     app_state["pd_last_time"] = time.time()
+
+    # Auto-calibration tap: the AudioCalibrator only buffers samples while a
+    # calibration phase is active. feed() is a no-op in the idle/done states.
+    if calibrator.is_capturing:
+        calibrator.feed(total_db, bass_db, treble_db)
 
     app_state["audio_frame_count"] += 1
     now = time.time()
@@ -717,6 +724,9 @@ if __name__ == "__main__":
         # Called after any PD relaunch (device change) to re-sync filter,
         # oscillator, and mute state from `params` into the fresh PD process.
         "push_pd_init": push_pd_init_params,
+        # Auto-calibration — the GUI drives phase start/stop and reads
+        # snapshot() for progress UI.
+        "calibrator": calibrator,
     }
     gui = TitanQtGUI(params, slider_cfg, engine, app_state, callbacks)
 
