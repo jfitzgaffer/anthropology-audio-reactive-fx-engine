@@ -930,11 +930,8 @@ if __name__ == "__main__":
         while True:
             try:
                 server = osc_server.ThreadingOSCUDPServer(("127.0.0.1", int(params["osc_in_port"])), disp)
+                'osc_in_port']}")
 
-                if app_state.get("port_conflict_osc"):
-                    logger.info(f"Port {params['osc_in_port']} freed! Resuming Audio Data listener.")
-                else:
-                    logger.info(f"Listening for Audio Data on Port {params['osc_in_port']}")
 
                 app_state["port_conflict_osc"] = False
                 server.serve_forever()
@@ -947,6 +944,10 @@ if __name__ == "__main__":
 
 
     audio_thread = threading.Thread(target=run_osc_server, daemon=True)
+                if app_state.get("port_conflict_osc"):
+                    logger.info(f"Port {params['osc_in_port']} freed! Resuming Audio Data listener.")
+                else:
+                    logger.info(f"Listening for Audio Data on Port {params[
     audio_thread.start()
 
     compute_thread = threading.Thread(target=compute_audio_thread, daemon=True, name="AudioCompute")

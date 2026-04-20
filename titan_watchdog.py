@@ -83,15 +83,13 @@ class TitanWatchdog:
             self.pd_process = None
 
     def get_pd_audio_devices(self):
-        """Asks Pure Data for its exact internal list of audio interfaces."""
         if not self.pd_executable:
             return ""
 
-        print("⚡️ Watchdog: Scanning for audio hardware...")
+        print("⚡️ Watchdog: Scanning for audio hardware...", flush=True)
 
         try:
-            # We add -nogui so it stays invisible, and use Popen so we can kill it
-            # (Because PD doesn't automatically quit after printing the list!)
+            # We use Popen with a shorter timeout strategy
             process = subprocess.Popen(
                 [self.pd_executable, "-nogui", "-listdev"],
                 stdout=subprocess.PIPE,
@@ -99,16 +97,14 @@ class TitanWatchdog:
                 text=True
             )
 
-            # Give PD half a second to print the list to the hidden console
-            time.sleep(0.5)
+            # Give it exactly 1 second to respond. If it doesn't, we kill it.
+            try:
+                out, err = process.communicate(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                out, err = process.communicate()
 
-            # Force kill it so it doesn't freeze our Python GUI
-            process.terminate()
-
-            # Grab whatever it printed (combining stdout and stderr just in case)
-            out, err = process.communicate(timeout=1)
             return str(out) + "\n" + str(err)
-
         except Exception as e:
-            print(f"Watchdog Scan Error: {e}")
+            print(f"⚠️ Watchdog: Scan Error: {e}", flush=True)
             return ""
