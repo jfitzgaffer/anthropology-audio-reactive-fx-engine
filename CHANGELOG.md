@@ -5,6 +5,52 @@ All notable changes to Titan Engine are documented here. Format follows
 
 ## [Unreleased]
 
+### [2026-04-20] - Auto-calibration wizard + scrollable settings panes + main-branch rule
+
+#### Added
+- **Two-phase Auto Calibrate wizard.** New button at the top of the
+  "1. Input Stage" group walks the user through a silent noise
+  measurement (6 s) followed by a voice measurement (12 s), then
+  proposes values for `floor`, `ceiling`, `input_trim`, `noise_gate`,
+  `hip`, `lop`, `expand`, `knee`, `env`, and `drive`. The analysis
+  works in Pd's positive-dB `rmstodb` scale (noise floor at P90,
+  voice ceiling at P99), auto-bumps `input_trim` when the voice peaks
+  too low, and shifts floor/ceiling by the applied dB gain so the
+  post-trim signal still lands in range. Bad runs (too few samples,
+  std-dev > 8 dB on noise, fewer than 30% active voice frames)
+  prompt the user to retry without losing the prior phase's data.
+  Live progress dialogs show elapsed time, sample count, and current
+  `total / bass / treble` dB readings. Applying the results writes
+  into `params`, syncs every slider/spinbox, and pushes the PD-side
+  `hip` / `lop` / `env` / `input_trim` over OSC so Pure Data picks
+  them up immediately. Files: `titan_calibration.py` (new),
+  `titan_gui.py::_setup_calibrate_button` and the `_cal_*` wizard
+  methods, `main_v5.01.py` (construct one global `AudioCalibrator`,
+  tap `handle_audio` with `calibrator.feed(...)`, expose via
+  `callbacks["calibrator"]`).
+
+#### Fixed
+- **Input Stage sliders no longer compress or hide the Auto
+  Calibrate button.** Every `QGroupBox` in `titan_layout.ui` has a
+  hard-coded `maximumSize` height (120 or 300 px); adding the
+  calibrate button pushed the Input Stage past its 300-px cap and
+  Qt responded by squeezing every row inside. Fix in
+  `titan_gui.py::_make_tabs_scrollable` (called at the end of
+  `__init__`): drops the height cap on every `QGroupBox` via
+  `setMaximumHeight(16777215)` and wraps each tab page under
+  `settings_tabs` in a `QScrollArea` (widget-resizable, no frame).
+  When the window is tall enough, panes size naturally; when it
+  shrinks, a vertical scroll bar appears automatically so no
+  control is ever hidden.
+
+#### Changed
+- **CLAUDE.md — new rule: main-branch default, no worktrees unless
+  asked.** After a round-trip where code changes landed in a Claude
+  worktree branch, had to be merged into `main`, and left PyCharm
+  blind until the merge completed, the agent is now explicitly
+  instructed to edit in the primary working directory on `main` by
+  default. Worktrees are only used when the operator asks for one.
+
 ### [2026-04-20] - Web remote: panic/mute GUI sync + 30 Hz bidirectional tracking
 
 #### Fixed
