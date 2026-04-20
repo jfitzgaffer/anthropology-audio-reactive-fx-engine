@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (QApplication, QVBoxLayout, QGridLayout, QFrame, Q
                                QWidget, QLabel, QSpinBox, QHBoxLayout, QPushButton, QTableWidget,
                                QAbstractItemView, QHeaderView, QGroupBox, QSlider, QCheckBox,
                                QLineEdit, QScrollArea, QComboBox, QDoubleSpinBox, QTableWidgetItem,
-                               QMessageBox, QTextEdit, QDialog)
+                               QMessageBox, QTextEdit, QDialog, QProgressBar, QDialogButtonBox)
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtCore import QFile, QTimer, Qt, QEvent, QObject, Signal
 from PySide6.QtGui import QColor, QFont, QBrush
@@ -143,6 +143,7 @@ class TitanQtGUI(QObject):
         self._setup_skew_ui()
         self._setup_mute_ui()
         self._setup_audio_device_selector()
+        self._setup_calibrate_button()
         self._setup_panic_button()
         self._link_widgets()
 
@@ -188,6 +189,31 @@ class TitanQtGUI(QObject):
         if hasattr(self.ui, 'InputState') and self.ui.InputState.layout():
             # insertWidget(0, ...) puts it at the absolute top of the layout
             self.ui.InputState.layout().insertWidget(0, self.ui.chk_mute)
+
+    def _setup_calibrate_button(self):
+        """Add the Auto Calibrate button to the top of the '1. Input Stage'
+        group, above the Gain / Highpass / Lowpass / Envelope sliders. Runs
+        after _setup_mute_ui, so the mute checkbox ends up directly below
+        the calibrate button."""
+        if not (hasattr(self.ui, 'InputState') and self.ui.InputState.layout()):
+            logger.warning("InputState group missing; Auto Calibrate button not attached.")
+            return
+
+        self.btn_auto_calibrate = QPushButton("🎚️ Auto Calibrate for Voice")
+        self.btn_auto_calibrate.setStyleSheet(
+            "QPushButton { background-color: #2d5a88; color: white; font-weight: bold; "
+            "padding: 8px; border-radius: 4px; } "
+            "QPushButton:hover { background-color: #3d7ab8; } "
+            "QPushButton:disabled { background-color: #444; color: #888; }"
+        )
+        self.btn_auto_calibrate.setToolTip(
+            "Walks you through a two-step wizard that measures noise, then voice, "
+            "and auto-sets floor/ceiling/trim/filters so lights react to the actor."
+        )
+        self.btn_auto_calibrate.clicked.connect(self._launch_calibration_wizard)
+        # Index 0 puts this above the mute checkbox inserted by _setup_mute_ui,
+        # which is the visual top of the Input Stage group.
+        self.ui.InputState.layout().insertWidget(0, self.btn_auto_calibrate)
 
     _PANIC_BUTTON_IDLE_STYLE = (
         "QPushButton { background-color: #cc0000; color: white; font-weight: bold; "
@@ -398,6 +424,290 @@ class TitanQtGUI(QObject):
             self._populate_device_combo(combo, devs, current_id)
             combo.blockSignals(False)
         logger.info(f"Audio devices rescanned ({len(in_devs)} input, {len(out_devs)} output).")
+
+    # --------------------------------------------------------------
+    # Auto-calibration wizard
+    # --------------------------------------------------------------
+
+    # Labels used in the result summary dialog. Maps param name → (label, format_fn).
+    _CAL_RESULT_FIELDS = [
+        ("floor", "Floor", lambda v: f"{v:.1f} dB"),
+        ("ceiling", "Ceiling", lambda v: f"{v:.1f} dB"),
+        ("input_trim", "Input Trim", lambda v: f"{v:.2f}x"),
+        ("noise_gate", "Noise Gate", lambda v: f"{v:.3f}"),
+        ("hip", "High-pass", lambda v: f"{v:.0f} Hz"),
+        ("lop", "Low-pass", lambda v: f"{v:.0f} Hz"),
+        ("expand", "Expand", lambda v: f"{v:.2f}"),
+        ("knee", "Knee", lambda v: f"{v:.3f}"),
+        ("env", "Env Window", lambda v: f"{v:.0f}"),
+        ("drive", "Drive", lambda v: f"{v:.2f}"),
+    ]
+
+    def _launch_calibration_wizard(self):
+        """Start the two-phase voice calibration flow.
+
+        Phase 1 asks the room to be silent, captures noise. Phase 2 asks the
+        actor to speak, captures voice. On success, a summary dialog shows
+        proposed params; the user clicks Apply to commit them.
+        """
+        calibrator = self.callbacks.get("calibrator") if self.callbacks else None
+        if calibrator is None:
+            QMessageBox.warning(self.ui, "Auto Calibrate",
+                                "Calibration is not wired up (no calibrator in callbacks).")
+            return
+        if calibrator.is_capturing:
+            QMessageBox.information(self.ui, "Auto Calibrate",
+                                    "A calibration run is already in progress.")
+            return
+        self._cal_phase1(calibrator)
+
+    def _cal_phase1(self, calibrator):
+        # Intro dialog. We want to give the user a chance to tell the room
+        # to quiet down before we start sampling.
+        proceed = QMessageBox.question(
+            self.ui,
+            "Step 1 / 2 — Measure Noise Floor",
+            f"<b>Have the actor stay silent for {calibrator.noise_duration:.0f} seconds.</b><br><br>"
+            "The engine will measure the ambient room noise so it knows where "
+            "real voice begins. Keep the environment as quiet as performance "
+            "conditions — background music, HVAC, crowd hum all count as noise.<br><br>"
+            "Ready?",
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Yes,
+        )
+        if proceed != QMessageBox.Yes:
+            return
+
+        calibrator.start_noise_phase()
+        self._cal_run_progress(calibrator, "Step 1 / 2 — Measuring Noise", self._cal_phase1_done)
+
+    def _cal_phase1_done(self, calibrator, cancelled):
+        if cancelled:
+            calibrator.cancel()
+            return
+        result = calibrator.compute_noise_result()
+        if not result.get("ok"):
+            retry = QMessageBox.question(
+                self.ui, "Noise Measurement Failed",
+                f"{result.get('reason', 'Unknown error.')}\n\nRetry?",
+                QMessageBox.Retry | QMessageBox.Cancel,
+                QMessageBox.Retry,
+            )
+            if retry == QMessageBox.Retry:
+                self._cal_phase1(calibrator)
+            return
+
+        proceed = QMessageBox.question(
+            self.ui,
+            "Step 2 / 2 — Measure Voice",
+            f"<b>Noise floor detected: {result['noise_floor_db']:.1f} dB.</b><br><br>"
+            f"Now have the actor speak at performance volume for "
+            f"{calibrator.voice_duration:.0f} seconds — normal lines, not "
+            f"a monotone hum. Keep talking the whole time.<br><br>Ready?",
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Yes,
+        )
+        if proceed != QMessageBox.Yes:
+            return
+
+        calibrator.start_voice_phase()
+        self._cal_run_progress(calibrator, "Step 2 / 2 — Measuring Voice", self._cal_phase2_done)
+
+    def _cal_phase2_done(self, calibrator, cancelled):
+        if cancelled:
+            calibrator.cancel()
+            return
+        result = calibrator.compute_voice_result()
+        if not result.get("ok"):
+            retry = QMessageBox.question(
+                self.ui, "Voice Measurement Failed",
+                f"{result.get('reason', 'Unknown error.')}\n\nRetry voice capture?",
+                QMessageBox.Retry | QMessageBox.Cancel,
+                QMessageBox.Retry,
+            )
+            if retry == QMessageBox.Retry:
+                # Retry only the voice phase — the noise result is still good.
+                calibrator.start_voice_phase()
+                self._cal_run_progress(calibrator, "Step 2 / 2 — Measuring Voice",
+                                       self._cal_phase2_done)
+            return
+        self._cal_show_results(result)
+
+    def _cal_run_progress(self, calibrator, title, on_done):
+        """Open a modal progress dialog that ticks once per frame and calls
+        `on_done(calibrator, cancelled)` when the capture finishes or is cancelled.
+
+        We poll the calibrator's snapshot() rather than wiring signals because
+        feed() runs on the OSC thread and can't safely emit Qt signals without
+        a QThread wrapper — polling from a QTimer on the event-loop thread is
+        simpler and lets us show live dB readouts anyway.
+        """
+        dlg = QDialog(self.ui)
+        dlg.setWindowTitle(title)
+        dlg.setModal(True)
+        dlg.setMinimumWidth(420)
+        lay = QVBoxLayout(dlg)
+
+        lbl_instruction = QLabel(title)
+        lbl_instruction.setStyleSheet("font-weight: bold; font-size: 14px;")
+        lay.addWidget(lbl_instruction)
+
+        progress = QProgressBar()
+        progress.setRange(0, 1000)
+        progress.setValue(0)
+        lay.addWidget(progress)
+
+        lbl_stats = QLabel("Starting…")
+        lbl_stats.setStyleSheet("font-family: 'Courier New', monospace;")
+        lay.addWidget(lbl_stats)
+
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(dlg.reject)
+        lay.addWidget(btn_cancel)
+
+        cancelled = {"flag": False}
+
+        def tick():
+            snap = calibrator.snapshot()
+            duration = max(0.001, snap["duration"])
+            frac = min(1.0, snap["elapsed"] / duration)
+            progress.setValue(int(frac * 1000))
+            last_total = snap["last_total"]
+            last_bass = snap["last_bass"]
+            last_treble = snap["last_treble"]
+            if last_total is None:
+                live_txt = "no audio yet — is Pure Data running?"
+            else:
+                live_txt = (
+                    f"total={last_total:6.1f} dB   bass={last_bass:6.1f} dB   "
+                    f"treble={last_treble:6.1f} dB"
+                )
+            lbl_stats.setText(
+                f"{snap['elapsed']:.1f} / {duration:.1f} s  |  "
+                f"samples: {snap['samples']}\n{live_txt}"
+            )
+            if snap["phase"] in ("noise_done", "voice_done"):
+                timer.stop()
+                dlg.accept()
+
+        timer = QTimer(dlg)
+        timer.timeout.connect(tick)
+        timer.start(50)
+
+        def on_reject():
+            cancelled["flag"] = True
+            timer.stop()
+
+        dlg.rejected.connect(on_reject)
+        dlg.exec()
+        timer.stop()
+        on_done(calibrator, cancelled["flag"])
+
+    def _cal_show_results(self, result):
+        """Show the summary dialog listing proposed param values side-by-side
+        with the current values, and let the user apply or cancel."""
+        new_params = result["params"]
+        diag = result["diagnostics"]
+
+        dlg = QDialog(self.ui)
+        dlg.setWindowTitle("Calibration Results")
+        dlg.setModal(True)
+        dlg.setMinimumWidth(480)
+        lay = QVBoxLayout(dlg)
+
+        header = QLabel(
+            f"<b>Voice peak:</b> {diag['voice_peak_db']:.1f} dB &nbsp; "
+            f"<b>Noise floor:</b> {diag['noise_floor_db']:.1f} dB<br>"
+            f"<b>Active frames:</b> {diag['active_frac'] * 100:.0f}% &nbsp; "
+            f"<b>Dynamic range:</b> {diag['voice_range_db']:.1f} dB"
+        )
+        header.setStyleSheet("padding: 6px;")
+        lay.addWidget(header)
+
+        grid = QGridLayout()
+        grid.addWidget(QLabel("<b>Parameter</b>"), 0, 0)
+        grid.addWidget(QLabel("<b>Current</b>"), 0, 1)
+        grid.addWidget(QLabel("<b>Proposed</b>"), 0, 2)
+        for row, (name, label, fmt) in enumerate(self._CAL_RESULT_FIELDS, start=1):
+            current = self.params.get(name, 0.0)
+            proposed = new_params.get(name, current)
+            try:
+                current_txt = fmt(float(current))
+            except (TypeError, ValueError):
+                current_txt = str(current)
+            try:
+                proposed_txt = fmt(float(proposed))
+            except (TypeError, ValueError):
+                proposed_txt = str(proposed)
+            grid.addWidget(QLabel(label), row, 0)
+            grid.addWidget(QLabel(current_txt), row, 1)
+            lbl_new = QLabel(proposed_txt)
+            try:
+                if abs(float(proposed) - float(current)) > 1e-6:
+                    lbl_new.setStyleSheet("color: #00ff66; font-weight: bold;")
+            except (TypeError, ValueError):
+                pass
+            grid.addWidget(lbl_new, row, 2)
+        lay.addLayout(grid)
+
+        note = QLabel(
+            "<i>Applying will overwrite the listed parameters and push the PD-side "
+            "filter/trim/env settings to Pure Data. All other parameters are left alone.</i>"
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #aaa; padding: 6px; font-size: 11px;")
+        lay.addWidget(note)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Apply | QDialogButtonBox.Cancel)
+        btns.button(QDialogButtonBox.Apply).setText("Apply")
+        btns.button(QDialogButtonBox.Apply).clicked.connect(dlg.accept)
+        btns.button(QDialogButtonBox.Cancel).clicked.connect(dlg.reject)
+        lay.addWidget(btns)
+
+        if dlg.exec() == QDialog.Accepted:
+            self._apply_calibration_params(new_params)
+
+    def _apply_calibration_params(self, new_params):
+        """Write calibrated values into params, sync the GUI widgets, and push
+        PD-side params so Pure Data picks up the new filter/env/trim immediately."""
+        pd_params = {"hip", "lop", "env", "input_trim"}
+        send_osc = self.callbacks.get("send_osc") if self.callbacks else None
+
+        for name, val in new_params.items():
+            self.params[name] = val
+            cfg = self.slider_cfg.get(name, {"min": 0.0, "max": 1.0})
+
+            spin = getattr(self.ui, f"spin_{name}", self.dyn_widgets.get(f"spin_{name}"))
+            sld = getattr(self.ui, f"sld_{name}", None)
+
+            if spin is not None:
+                spin.blockSignals(True)
+                try:
+                    spin.setValue(float(val))
+                except TypeError:
+                    spin.setValue(int(val))
+                spin.blockSignals(False)
+
+            if sld is not None:
+                sld.blockSignals(True)
+                min_v = float(cfg.get("min", 0.0))
+                max_v = float(cfg.get("max", 1.0))
+                ratio = (float(val) - min_v) / max(0.001, (max_v - min_v))
+                sld.setValue(int(max(0.0, min(1.0, ratio)) * 100))
+                sld.blockSignals(False)
+
+            if name in pd_params and send_osc is not None:
+                try:
+                    send_osc(name, float(val))
+                except Exception as e:
+                    logger.warning(f"calibration: send_osc({name}) failed: {e}")
+
+        self.app_state["gui_lock_time"] = time.time()
+        logger.info(f"Calibration applied: {new_params}")
+        QMessageBox.information(
+            self.ui, "Calibration Applied",
+            "Calibrated parameters are now live. Save via File → Save Patch if you want to keep them."
+        )
 
     def _show_audio_device_popup(self):
         """Quick device-picker popup bound to the middle-section status dot.
