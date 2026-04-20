@@ -146,6 +146,7 @@ class TitanQtGUI(QObject):
         self._setup_calibrate_button()
         self._setup_panic_button()
         self._link_widgets()
+        self._make_tabs_scrollable()
 
         # Intercept the main window's Close event so we can prompt the gaffer
         # to confirm when Art-Net is still transmitting — filter installed in
@@ -214,6 +215,49 @@ class TitanQtGUI(QObject):
         # Index 0 puts this above the mute checkbox inserted by _setup_mute_ui,
         # which is the visual top of the Input Stage group.
         self.ui.InputState.layout().insertWidget(0, self.btn_auto_calibrate)
+
+    def _make_tabs_scrollable(self):
+        """Make the settings panes grow with their content and add a scroll
+        bar when the window is too short.
+
+        Two steps:
+        1. Drop the hard-coded height caps on every QGroupBox (the .ui file
+           sets QGroupBox.maximumSize.height to small values like 120/300,
+           which squeezes sliders whenever we add or resize content).
+        2. Wrap each tab page under `settings_tabs` in a QScrollArea so a
+           vertical scroll bar appears automatically when the window can't
+           fit every group box at once.
+        """
+        # Step 1 — relax height caps. Width caps are load-bearing for the
+        # horizontal layouts inside each group, so we leave them alone.
+        for box in self.ui.findChildren(QGroupBox):
+            box.setMaximumHeight(16777215)
+
+        # Step 2 — wrap each tab page in a QScrollArea. We move the tab's
+        # existing layout onto a fresh `inner` container, install that
+        # container inside the scroll area, then give the tab a new minimal
+        # layout that holds only the scroll area. Qt re-parents the child
+        # widgets to `inner` automatically when the layout is transferred.
+        tabs = getattr(self.ui, 'settings_tabs', None)
+        if tabs is None:
+            return
+        for i in range(tabs.count()):
+            tab = tabs.widget(i)
+            old_layout = tab.layout()
+            if old_layout is None:
+                continue
+
+            inner = QWidget()
+            inner.setLayout(old_layout)
+
+            scroll = QScrollArea()
+            scroll.setWidget(inner)
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.NoFrame)
+
+            wrap = QVBoxLayout(tab)
+            wrap.setContentsMargins(0, 0, 0, 0)
+            wrap.addWidget(scroll)
 
     _PANIC_BUTTON_IDLE_STYLE = (
         "QPushButton { background-color: #cc0000; color: white; font-weight: bold; "
