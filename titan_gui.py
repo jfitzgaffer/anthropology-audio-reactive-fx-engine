@@ -2245,6 +2245,35 @@ class TitanQtGUI(QObject):
             logger.error(f"apply_changes failed: {e}")
 
     def refresh_logic(self):
+        # --- Panic button visual sync ---
+        # `self.btn_panic` is driven by `app_state["panic_blackout"]`. When a
+        # web-remote client toggles panic, `app_state` is updated on the HTTP
+        # thread but the button's setText/setStyleSheet only ran inside the
+        # local click handler — so the Qt window stayed stale. Mirror the
+        # state here every frame (cheap diff check first to avoid redundant
+        # Qt paint ops).
+        if hasattr(self, 'btn_panic'):
+            panic_active = bool(self.app_state.get("panic_blackout", False))
+            if getattr(self, '_last_panic_visual', None) != panic_active:
+                self._last_panic_visual = panic_active
+                if panic_active:
+                    self.btn_panic.setText("BLACKOUT ACTIVE — CLICK TO RESTORE")
+                    self.btn_panic.setStyleSheet(self._PANIC_BUTTON_ACTIVE_STYLE)
+                else:
+                    self.btn_panic.setText("PANIC BLACKOUT")
+                    self.btn_panic.setStyleSheet(self._PANIC_BUTTON_IDLE_STYLE)
+
+        # --- Mute checkbox visual sync ---
+        # Same rationale: `params["mute"]` is written by web/QLC+; reflect it
+        # onto the QCheckBox. blockSignals so our setChecked doesn't re-enter
+        # the mute-toggled handler.
+        if hasattr(self.ui, 'chk_mute'):
+            mute_on = bool(int(self.params.get("mute", 0)))
+            if self.ui.chk_mute.isChecked() != mute_on:
+                self.ui.chk_mute.blockSignals(True)
+                self.ui.chk_mute.setChecked(mute_on)
+                self.ui.chk_mute.blockSignals(False)
+
         if hasattr(self, 'lbl_stat_fps'):
             self.lbl_stat_fps.setText(f"{self.app_state.get('current_fps', 0.0):.1f}")
 
@@ -2404,9 +2433,15 @@ class TitanQtGUI(QObject):
                     self.lbl_stat_test.setText("⚫ OFF")
                     self.lbl_stat_test.setStyleSheet("color: #555555; font-weight: normal;")
 
-            # --- 5. SYNC SLIDERS TO INCOMING DMX ---
-            # If remote is ON and receiving data, make the sliders physically follow the DMX
-            if "🟢" in self.app_state.get("osc_in_text", ""):
+            # --- 5. SYNC SLIDERS TO INCOMING DMX / WEB REMOTE ---
+            # If remote DMX is receiving, or a web-remote write just happened,
+            # make the sliders/spinboxes physically follow the new param values.
+            # `web_sync_latch` is set to True by the web-remote command handler
+            # on every successful param/mute/dimmer/panic change; we `pop` it
+            # here so the sync fires exactly once per web command (CPython dict
+            # ops are atomic, no lock needed).
+            web_dirty = self.app_state.pop("web_sync_latch", False)
+            if "🟢" in self.app_state.get("osc_in_text", "") or web_dirty:
                 for name, cfg in self.slider_cfg.items():
                     # Handle the Multiplexer targeting logic
                     target_name = name

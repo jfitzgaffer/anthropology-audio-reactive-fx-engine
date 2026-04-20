@@ -5,6 +5,218 @@ All notable changes to Titan Engine are documented here. Format follows
 
 ## [Unreleased]
 
+### [2026-04-20] - Web remote: panic/mute GUI sync + 30 Hz bidirectional tracking
+
+#### Fixed
+- **Panic and Mute buttons no longer lag the web remote.** Pressing
+  PANIC BLACKOUT or MUTE in the browser updated `app_state` /
+  `params` correctly (DMX output went dark, PD muted) but the Qt
+  window's button face stayed in its old state — the user had no
+  visual confirmation from the main rig computer that the command
+  had landed. Root cause: the Qt button's `setText` /
+  `setStyleSheet` / `setChecked` only ran inside their local click
+  handlers, which the HTTP thread never invokes.
+  Fix in `titan_gui.py::refresh_logic` (runs every 33 ms): mirror
+  `app_state["panic_blackout"]` onto `self.btn_panic`
+  (text + style) and `params["mute"]` onto `self.ui.chk_mute`
+  (with `blockSignals` wrapping `setChecked` so the sync doesn't
+  re-enter the mute-toggled handler and bounce the value back to
+  PD). Cheap diff check on `_last_panic_visual` avoids redundant
+  Qt paint ops on every tick.
+
+#### Changed
+- **Web-remote slider tracking is now ~30 Hz in both directions.**
+  Previously sliders felt "choppy": finger drags on the phone only
+  POSTed on release (`onchange`), and the browser only polled
+  `/api/state` every 500 ms, so the Qt window updated in two big
+  jumps per drag instead of a smooth sweep.
+  In `main_v5.01.py::_WEB_HTML`:
+    - Slider `input` listener now POSTs every value change,
+      throttled per-key to 33 ms (≈30 Hz) via a `lastSent`
+      timestamp — matches the Art-Net frame cadence and Qt's
+      `refresh_logic` QTimer. The existing `change` listener
+      still fires on release to guarantee the final settled
+      value is authoritative even if it falls inside the throttle
+      window.
+    - Poll interval dropped from **500 ms → 33 ms** and wrapped
+      in a re-entrancy guard (`polling` boolean) so slow networks
+      or backgrounded tabs skip ticks instead of piling up
+      in-flight fetches.
+    - `dragUntil` suppression window reduced from **1000 ms →
+      250 ms** — well above the new 33 ms poll interval, well
+      below human reaction time, so polls no longer wait a full
+      second after a drag ends before the web UI will accept a
+      value from another control surface.
+
+---
+
+### [2026-04-20] - Fix UnicodeEncodeError on web page load (lone UTF-16 surrogates)
+
+#### Fixed
+- **`main_v5.01.py:469`** — every `GET /` to the web remote was returning
+  500 because `_WEB_HTML.encode('utf-8')` raised
+  `UnicodeEncodeError: 'utf-8' codec can't encode characters in
+  position 8823-8824: surrogates not allowed`. The audio-status line
+  used `'\ud83d\udfe2 LIVE'` and `'\ud83d\udd34 NO INPUT'` — the
+  UTF-16 surrogate-pair encoding of 🟢 and 🔴. Python strings are
+  Unicode codepoints, not UTF-16 code units, so `\ud83d` on its own
+  is a *lone* high surrogate (U+D83D) — a reserved codepoint that's
+  illegal in UTF-8 by design (RFC 3629 §3).
+  Replaced both with the 8-hex-digit astral form: `\U0001F7E2` and
+  `\U0001F534`. These resolve to single codepoints in the BMP
+  overflow range (U+1F000..U+1FFFF) and encode cleanly as 4-byte
+  UTF-8 sequences. Verified: HTML now encodes to 10 204 bytes
+  without error; `ord()` on the emoji characters returns the real
+  codepoint, not a surrogate.
+
+---
+
+### [2026-04-20] - Web remote: full slider bank + main-GUI sync + audio LIVE status
+
+#### Added
+- **`WEB_SLIDERS` config + dynamic slider bank in the web remote.** 21 new
+  sliders covering every Audio Input, Audio Mapping, and Dynamics knob the
+  gaffer is likely to want on a phone during a show:
+    - Master: `master_inhibitive`
+    - Audio Input: `input_trim`, `noise_gate`, `drive`, `floor`, `ceiling`,
+      `expand`, `hip`, `lop`
+    - Audio Mapping: `gamma`, `eq_tilt`, `knee`, `scale`
+    - Dynamics: `atk_c`, `rel_c`, `atk_e`, `rel_e`, `time_gamma`,
+      `jitter_thresh`, `jitter_amount`, `smooth_size`
+  `WEB_SLIDERS` is a list of dicts in `main_v5.01.py` — one source of truth
+  for section header, label, min/max, step, log-scale flag, and a JS
+  formatter expression. It's `json.dumps`'d into the HTML template via a
+  `__SLIDERS_JSON__` placeholder so the Python literal never has to quote
+  a JS array by hand. The client builds the slider DOM from this array.
+- **Log-scale mapping on `hip`, `lop`, `scale`, `atk_c`, `rel_c`, `atk_e`,
+  `rel_e`.** Linear range inputs on 20..20000 Hz were unusable (90 % of
+  the travel was >2 kHz); the JS now maps slider travel logarithmically
+  for any entry with `log:true`.
+- **Drag-lock (`dragUntil` map) on the client.** `oninput` sets a 1-second
+  suppression per-key so the 500 ms `/api/state` poll doesn't fight the
+  user's finger while they're dragging.
+- **`"param"` command** in the web handler. `POST /api/command
+  {"cmd":"param","key":"input_trim","value":2.5}`. Clamps to the
+  slider's declared min/max, respects integer vs float semantics (step
+  ≥ 1 → `int(round(v))`), and forwards to PD via `notify_pd()` which
+  internally filters by `PD_INIT_PARAMS` so only `hip`, `lop`, `env`,
+  `input_trim`, etc. actually leave the process.
+- **`WEB_PARAM_WHITELIST`** (derived from `WEB_SLIDERS`) — anything not
+  in this set is rejected with a WARN log. Prevents a compromised or
+  malformed client from writing arbitrary keys like `ctrl_univ` or
+  `preset_ch` that would break live output.
+
+#### Changed
+- **Main Qt GUI now tracks web-remote changes.** `titan_gui.py::refresh_logic`
+  already had a params→widgets sync block gated on `"🟢" in osc_in_text`
+  (designed for QLC+ remote DMX). The gate now also fires when the web
+  handler set `app_state["web_sync_latch"] = True`. The flag is consumed
+  with `dict.pop(…, False)` so the sync runs exactly once per web
+  command; CPython dict ops are atomic so no lock is needed. Moving
+  the Master Dimmer on the phone now physically moves the Master
+  slider in the Qt window.
+- **Audio status in the web UI is now pipeline-accurate.** Previously it
+  read `app_state["osc_in_text"]`, which is the DMX-remote status
+  (defaults to `🔴 WAIT` when no console is sending Art-Net). The web
+  now shows `🟢 LIVE` when `pd_last_time` is < 500 ms old, `🔴 NO
+  INPUT` otherwise. This matches what the gaffer means by "is audio
+  flowing", independent of any DMX remote console.
+- **FPS and Art-Net packet-count rows removed** from the web status
+  block per the "gaffer, not a programmer" directive in CLAUDE.md.
+  They were adding cognitive load without telling the user anything
+  they could act on.
+
+---
+
+### [2026-04-20] - Web remote: fix broken JS (preset-button escape swallowed by Python)
+
+#### Fixed
+- **`main_v5.01.py:382`** — the entire web remote was dead on arrival because
+  the generated `<script>` block had a JavaScript parse error. The source read
+  ```python
+  html+='<div class="pbtn'+cls+'" onclick="sendCmd(\'preset\','+i+')">'+nm+'</div>';
+  ```
+  and was embedded inside a Python triple-double-quoted string (`_WEB_HTML`).
+  Python interprets `\'` as an escape even inside `"""..."""` — it strips the
+  backslash and leaves a bare `'`. So the browser actually received
+  ```js
+  html+='<div class="pbtn'+cls+'" onclick="sendCmd('preset','+i+')">'+nm+'</div>';
+  ```
+  which contains the invalid token sequence `'" onclick="sendCmd(' preset ','`
+  — a string literal directly juxtaposed with an identifier, with no
+  operator. V8 (Chrome), JavaScriptCore (Safari), and SpiderMonkey
+  (Firefox) all halt the entire `<script>` block on this SyntaxError,
+  meaning `poll()` never ran, `setInterval` never armed, and the inline
+  `onclick="sendCmd('panic',!panic)"` handlers reference a `sendCmd`
+  symbol that was never defined — so every button press was a no-op.
+  User symptom: status values stuck on em-dash, buttons do nothing,
+  server log shows no `Web remote cmd:` lines despite clicks.
+
+  Fix: change `\'preset\'` to `\\'preset\\'` in the Python source so the
+  emitted JS contains `\'preset\'` as a JavaScript escape sequence
+  inside the outer single-quoted string. Verified by re-executing the
+  `_WEB_HTML = """…"""` literal in an isolated namespace — the
+  browser now receives a parseable concatenation whose five string
+  pieces all close cleanly.
+
+  How this was missed: the bug is invisible to `curl` and to the Python
+  linter. The HTML bytes are valid UTF-8, the HTTP status is 200, and
+  Python has no way to know the emitted string will be parsed as JS. It
+  only manifests when a real JS engine tries to evaluate the page.
+
+---
+
+### [2026-04-20] - Web remote: fix silent mute + surface request errors
+
+#### Fixed
+- **`main_v5.01.py:449`** — Web remote's MUTE button sent OSC to PD with the
+  wrong key. `_handle()` called `notify_pd("/mute", ...)` with a leading
+  slash, but `notify_pd` whitelists bare names (`PD_INIT_PARAMS =
+  ["hip", "lop", "env", "test_freq", "test_db", "test_on", "sweep_on",
+  "input_trim", "mute"]`) and prepends the slash itself via
+  `f"/{name}"`. The whitelist check `if name in PD_INIT_PARAMS` saw
+  `"/mute"` ≠ `"mute"` and silently dropped the message. PD never
+  received the mute, so the web button's state flipped in the UI but
+  audio kept flowing. Now passes `"mute"` (no slash). `params["mute"]`
+  mirror was already correct — this was strictly an OSC-to-PD loss.
+
+#### Changed
+- **`do_GET` and `do_POST` now wrap their handlers in `try/except`** with
+  `logger.exception(...)` + `send_response(500)`. Previously any handler
+  error propagated up into `BaseHTTPRequestHandler` and — combined with
+  the `log_message(self, fmt, *args): pass` suppression one line up —
+  produced a silently-failing request with no log trail. Any future
+  500-class bug in `_state()`, `_handle()`, or the JSON round-trip will
+  now print a full traceback to the engine log.
+- **`do_POST` logs every command** at INFO level as `Web remote cmd:
+  {'cmd': '…', 'value': …}` so the operator can confirm button presses
+  are arriving from the phone/tablet. Paired with the web server's
+  existing "Web remote UI: http://…" boot banner this gives end-to-end
+  visibility.
+- **`_handle` now logs unknown commands** with
+  `logger.warning(f"Web remote: unknown command {cmd!r}")`. Previously
+  a typo in the HTML's `sendCmd('typo', ...)` would return an empty
+  state update with no hint anything was wrong.
+
+---
+
+### [2026-04-20] - Fix SyntaxError in run_osc_server logging block
+
+#### Fixed
+- **`main_v5.01.py:929–949`**: `run_osc_server()` would not parse
+  (`SyntaxError: unmatched ']'` at line 933). A four-line
+  `if app_state.get("port_conflict_osc"): logger.info(...) else:
+  logger.info(...)` block that belonged inside the `try:` had been
+  split in half and relocated between the `audio_thread = Thread(...)`
+  and `audio_thread.start()` lines, truncated mid-f-string and leaving
+  `'osc_in_port']}")` as an orphan token. Restored the full `if/else`
+  block in its correct position immediately after
+  `ThreadingOSCUDPServer(...)`, and removed the displaced fragment from
+  between the two `audio_thread` lines. File now parses cleanly
+  (`python -c "import ast; ast.parse(open('main_v5.01.py').read())"`).
+
+---
+
 ### [2026-04-18] - Fixture preview strip, ArtPoll network discovery, web remote UI
 
 #### Added

@@ -300,6 +300,45 @@ def artpoll_scan(timeout=3.0):
     return results
 
 
+# Web-remote slider config. Each entry drives one slider in the browser AND
+# gets added to WEB_PARAM_WHITELIST on the server. `log:true` turns the slider
+# into a log-scale mapping on the client (20..20000 Hz is unusable on a
+# linear range input because 90% of the travel covers values above 2kHz).
+# `fmt` is a JS snippet run on the current value to produce the display
+# text next to the label.
+WEB_SLIDERS = [
+    {"section": "Master",        "key": "master_inhibitive", "label": "Master Dimmer",   "min": 0.0,  "max": 1.0,   "step": 0.01, "log": False, "fmt": "(v*100).toFixed(0)+'%'"},
+    {"section": "Audio Input",   "key": "input_trim",        "label": "Input Trim",      "min": 0.0,  "max": 5.0,   "step": 0.1,  "log": False, "fmt": "v.toFixed(1)+'x'"},
+    {"section": "Audio Input",   "key": "noise_gate",        "label": "Noise Gate",      "min": 0.0,  "max": 0.5,   "step": 0.01, "log": False, "fmt": "v.toFixed(2)"},
+    {"section": "Audio Input",   "key": "drive",             "label": "Drive",           "min": 1.0,  "max": 5.0,   "step": 0.1,  "log": False, "fmt": "v.toFixed(1)+'x'"},
+    {"section": "Audio Input",   "key": "floor",             "label": "Floor",           "min": 0,    "max": 120,   "step": 1,    "log": False, "fmt": "v.toFixed(0)+' dB'"},
+    {"section": "Audio Input",   "key": "ceiling",           "label": "Ceiling",         "min": 0,    "max": 120,   "step": 1,    "log": False, "fmt": "v.toFixed(0)+' dB'"},
+    {"section": "Audio Input",   "key": "expand",            "label": "Expand",          "min": 1.0,  "max": 4.0,   "step": 0.1,  "log": False, "fmt": "v.toFixed(1)+'x'"},
+    {"section": "Audio Input",   "key": "hip",               "label": "Highpass",        "min": 20,   "max": 20000, "step": 1,    "log": True,  "fmt": "v>=1000?(v/1000).toFixed(1)+' kHz':v.toFixed(0)+' Hz'"},
+    {"section": "Audio Input",   "key": "lop",               "label": "Lowpass",         "min": 20,   "max": 20000, "step": 1,    "log": True,  "fmt": "v>=1000?(v/1000).toFixed(1)+' kHz':v.toFixed(0)+' Hz'"},
+    {"section": "Audio Mapping", "key": "gamma",             "label": "Gamma",           "min": 0.1,  "max": 5.0,   "step": 0.1,  "log": False, "fmt": "v.toFixed(1)"},
+    {"section": "Audio Mapping", "key": "eq_tilt",           "label": "EQ Tilt",         "min": -1.0, "max": 1.0,   "step": 0.05, "log": False, "fmt": "(v>0?'+':'')+v.toFixed(2)"},
+    {"section": "Audio Mapping", "key": "knee",              "label": "Knee",            "min": 0.0,  "max": 0.5,   "step": 0.01, "log": False, "fmt": "v.toFixed(2)"},
+    {"section": "Audio Mapping", "key": "scale",             "label": "Scale",           "min": 1.0,  "max": 10.0,  "step": 0.1,  "log": True,  "fmt": "v.toFixed(1)+'x'"},
+    {"section": "Dynamics",      "key": "atk_c",             "label": "Attack (Center)", "min": 1,    "max": 1000,  "step": 1,    "log": True,  "fmt": "v.toFixed(0)+' ms'"},
+    {"section": "Dynamics",      "key": "rel_c",             "label": "Release (Center)","min": 1,    "max": 2000,  "step": 1,    "log": True,  "fmt": "v.toFixed(0)+' ms'"},
+    {"section": "Dynamics",      "key": "atk_e",             "label": "Attack (Edge)",   "min": 1,    "max": 1000,  "step": 1,    "log": True,  "fmt": "v.toFixed(0)+' ms'"},
+    {"section": "Dynamics",      "key": "rel_e",             "label": "Release (Edge)",  "min": 1,    "max": 2000,  "step": 1,    "log": True,  "fmt": "v.toFixed(0)+' ms'"},
+    {"section": "Dynamics",      "key": "time_gamma",        "label": "Time Gamma",      "min": 0.1,  "max": 5.0,   "step": 0.1,  "log": False, "fmt": "v.toFixed(1)"},
+    {"section": "Dynamics",      "key": "jitter_thresh",     "label": "Jitter Threshold","min": 0.01, "max": 0.2,   "step": 0.01, "log": False, "fmt": "v.toFixed(2)"},
+    {"section": "Dynamics",      "key": "jitter_amount",     "label": "Jitter Amount",   "min": 1.0,  "max": 20.0,  "step": 0.5,  "log": False, "fmt": "v.toFixed(1)"},
+    {"section": "Dynamics",      "key": "smooth_size",       "label": "Smooth Size",     "min": 1,    "max": 10,    "step": 1,    "log": False, "fmt": "v.toFixed(0)"},
+]
+
+# Keys the web `_handle()` is allowed to write, derived from WEB_SLIDERS above
+# so there's a single source of truth. Anything not in this set is rejected
+# with a WARN log.
+WEB_PARAM_WHITELIST = {s["key"] for s in WEB_SLIDERS}
+
+# JSON-serialized config that gets injected into the HTML and read by the
+# client-side JS to build the slider DOM.
+_WEB_SLIDERS_JSON = json.dumps(WEB_SLIDERS)
+
 _WEB_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -308,13 +347,13 @@ _WEB_HTML = """<!DOCTYPE html>
 <title>Titan Engine Remote</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:#111;color:#eee;font-family:-apple-system,BlinkMacSystemFont,sans-serif;padding:16px;max-width:600px;margin:0 auto}
+body{background:#111;color:#eee;font-family:-apple-system,BlinkMacSystemFont,sans-serif;padding:16px;max-width:600px;margin:0 auto;padding-bottom:60px}
 h1{font-size:20px;margin-bottom:16px;color:#aaa;text-align:center;letter-spacing:2px}
-h2{font-size:12px;color:#555;margin:18px 0 8px;text-transform:uppercase;letter-spacing:1px}
+h2{font-size:12px;color:#00ff66;margin:22px 0 10px;text-transform:uppercase;letter-spacing:1.5px;border-bottom:1px solid #222;padding-bottom:4px}
 .status{background:#1a1a1a;border-radius:8px;padding:12px;margin-bottom:12px}
-.row{display:flex;justify-content:space-between;padding:3px 0;font-size:13px}
-.val{font-family:monospace}
-.green{color:#0f0}.yellow{color:#ff0}.red{color:#f44}.gray{color:#555}
+.row{display:flex;justify-content:space-between;align-items:center;padding:3px 0;font-size:14px}
+.val{font-family:monospace;font-weight:bold}
+.green{color:#00ff66}.yellow{color:#ff0}.red{color:#ff5555}.gray{color:#555}
 .btn{display:block;width:100%;padding:20px;margin:8px 0;border-radius:10px;font-size:18px;font-weight:bold;border:none;cursor:pointer;transition:opacity .1s;-webkit-tap-highlight-color:transparent}
 .btn:active{opacity:.7}
 .btn-off{background:#222;color:#ccc;border:1px solid #333}
@@ -322,12 +361,13 @@ h2{font-size:12px;color:#555;margin:18px 0 8px;text-transform:uppercase;letter-s
 .btn-restore{background:#ff8800;color:#fff}
 .btn-mute{background:#333;color:#ff8c00;border:1px solid #ff8c00}
 .btn-muted{background:#ff8c00;color:#111}
-.range-wrap{margin:8px 0}
-.range-wrap label{font-size:13px;color:#aaa;display:flex;justify-content:space-between}
-input[type=range]{width:100%;height:44px;accent-color:#0f0;cursor:pointer}
+.slider-row{margin:10px 0;background:#161616;border-radius:6px;padding:8px 10px}
+.slider-row label{font-size:13px;color:#aaa;display:flex;justify-content:space-between;margin-bottom:4px}
+.slider-row label .lv{color:#00ff66;font-family:monospace;font-weight:bold}
+input[type=range]{width:100%;height:36px;accent-color:#00ff66;cursor:pointer}
 .presets{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin:8px 0}
 .pbtn{padding:14px 0;border-radius:6px;background:#1a1a1a;color:#555;border:1px solid #2a2a2a;font-size:13px;cursor:pointer;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;-webkit-tap-highlight-color:transparent}
-.pbtn.live{background:#1a2a1a;color:#6f6;border-color:#3a5a3a}
+.pbtn.live{background:#1a2a1a;color:#00ff66;border-color:#3a5a3a}
 .pbtn:active{opacity:.7}
 </style>
 </head>
@@ -335,27 +375,101 @@ input[type=range]{width:100%;height:44px;accent-color:#0f0;cursor:pointer}
 <h1>&#9889; TITAN ENGINE</h1>
 <div class="status">
   <div class="row"><span>Audio</span><span class="val" id="s-audio">&#x2014;</span></div>
-  <div class="row"><span>FPS</span><span class="val" id="s-fps">&#x2014;</span></div>
-  <div class="row"><span>Art-Net</span><span class="val" id="s-pkts">&#x2014;</span></div>
 </div>
 <button id="btn-panic" class="btn btn-off" onclick="sendCmd('panic',!panic)">PANIC BLACKOUT</button>
 <button id="btn-mute" class="btn btn-mute" onclick="sendCmd('mute',!mute)">MUTE</button>
-<h2>Master Dimmer</h2>
-<div class="range-wrap">
-  <label><span>Level</span><span id="dv">255</span></label>
-  <input type="range" id="sld" min="0" max="255" value="255"
-    oninput="document.getElementById('dv').textContent=this.value"
-    onchange="sendCmd('dimmer',+this.value)">
-</div>
+<div id="slider-container"></div>
 <h2>Presets</h2>
 <div class="presets" id="pgrid"></div>
 <script>
 var panic=false,mute=false;
-function sendCmd(cmd,val){
-  fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd:cmd,value:val})})
-  .then(r=>r.json()).then(apply);
+// Injected server-side; one entry per exposed slider.
+var SLIDERS=__SLIDERS_JSON__;
+// Per-key "don't overwrite me, I'm dragging" deadlines (ms since epoch).
+var dragUntil={};
+// Cache of last server value per key so unnecessary DOM writes are skipped.
+var lastVal={};
+
+// Log-scale helpers: slider travel 0..1000 maps to [min..max] logarithmically
+// so hip/lop (20..20000) are usable on a phone.
+function toSliderPos(cfg,v){
+  if(cfg.log){
+    var lmin=Math.log(cfg.min),lmax=Math.log(cfg.max);
+    return Math.round(1000*(Math.log(Math.max(cfg.min,v))-lmin)/(lmax-lmin));
+  }
+  return Math.round(1000*(v-cfg.min)/(cfg.max-cfg.min));
 }
+function fromSliderPos(cfg,p){
+  if(cfg.log){
+    var lmin=Math.log(cfg.min),lmax=Math.log(cfg.max);
+    return Math.exp(lmin+(p/1000)*(lmax-lmin));
+  }
+  return cfg.min+(p/1000)*(cfg.max-cfg.min);
+}
+function snap(cfg,v){
+  var s=cfg.step||0.01;
+  return Math.round(v/s)*s;
+}
+
+function sendCmd(cmd,val,key){
+  var body={cmd:cmd,value:val};
+  if(key)body.key=key;
+  fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+  .then(r=>r.json()).then(apply).catch(function(){});
+}
+
+function buildSliders(){
+  var cont=document.getElementById('slider-container');
+  var lastSection='';
+  var html='';
+  for(var i=0;i<SLIDERS.length;i++){
+    var c=SLIDERS[i];
+    if(c.section!==lastSection){
+      html+='<h2>'+c.section+'</h2>';
+      lastSection=c.section;
+    }
+    html+='<div class="slider-row" id="row-'+c.key+'">'
+       +'<label><span>'+c.label+'</span><span class="lv" id="lv-'+c.key+'">\u2014</span></label>'
+       +'<input type="range" id="sl-'+c.key+'" min="0" max="1000" step="1" value="0" '
+       +'data-key="'+c.key+'" data-idx="'+i+'"></div>';
+  }
+  cont.innerHTML=html;
+  // Wire up each slider's input/change handlers. oninput fires during drag
+  // for live label updates + drag-lock; onchange fires on release for the
+  // network POST.
+  for(var i=0;i<SLIDERS.length;i++){
+    (function(cfg){
+      var sl=document.getElementById('sl-'+cfg.key);
+      var lv=document.getElementById('lv-'+cfg.key);
+      // Per-key last-send timestamp for the 30Hz throttle on `input` events.
+      var lastSent=0;
+      sl.addEventListener('input',function(){
+        var v=snap(cfg,fromSliderPos(cfg,+this.value));
+        lv.textContent=eval(cfg.fmt);
+        // Suppress server overwrites for 250ms after last user input —
+        // well above the 33ms poll interval, well below human perception.
+        var now=Date.now();
+        dragUntil[cfg.key]=now+250;
+        // Throttle `input`-driven POSTs to ~30Hz so the Python GUI
+        // tracks the drag in real time instead of only on release.
+        if(now-lastSent>=33){
+          lastSent=now;
+          sendCmd('param',v,cfg.key);
+        }
+      });
+      sl.addEventListener('change',function(){
+        // Always send the final value on release, even if it's within the
+        // 33ms throttle window — guarantees the server ends up with the
+        // value the user actually settled on.
+        var v=snap(cfg,fromSliderPos(cfg,+this.value));
+        sendCmd('param',v,cfg.key);
+      });
+    })(SLIDERS[i]);
+  }
+}
+
 function apply(s){
+  if(!s)return;
   panic=!!s.panic; mute=s.mute>0;
   var pb=document.getElementById('btn-panic');
   pb.className='btn '+(panic?'btn-restore':'btn-panic');
@@ -363,31 +477,65 @@ function apply(s){
   var mb=document.getElementById('btn-mute');
   mb.className='btn '+(mute?'btn-muted':'btn-mute');
   mb.textContent=mute?'MUTED \u2014 TAP TO RESTORE':'MUTE';
+  // Audio status: green LIVE when PD frames arrived < 500ms ago, red NO INPUT otherwise.
   var ael=document.getElementById('s-audio');
-  ael.textContent=s.audio_status||'\u2014';
+  ael.textContent=s.audio_ok?'\U0001F7E2 LIVE':'\U0001F534 NO INPUT';
   ael.className='val '+(s.audio_ok?'green':'red');
-  document.getElementById('s-fps').textContent=(+s.fps||0).toFixed(1)+' Hz';
-  var pa=s.art_packets||0;
-  var pke=document.getElementById('s-pkts');
-  pke.textContent=s.artnet_active?(pa+' pkts'):'OFF';
-  pke.className='val '+(s.artnet_active&&pa>0?'green':'red');
-  var d=Math.round((+s.dimmer||1)*255);
-  document.getElementById('sld').value=d;
-  document.getElementById('dv').textContent=d;
+  // Update every slider from the server's param dict, unless the user is
+  // currently dragging it (dragUntil check).
+  var now=Date.now();
+  if(s.params){
+    for(var i=0;i<SLIDERS.length;i++){
+      var c=SLIDERS[i];
+      var v=s.params[c.key];
+      if(v===undefined||v===null)continue;
+      if((dragUntil[c.key]||0)>now)continue;
+      if(lastVal[c.key]===v)continue;
+      lastVal[c.key]=v;
+      var sl=document.getElementById('sl-'+c.key);
+      var lv=document.getElementById('lv-'+c.key);
+      if(sl){
+        var pos=toSliderPos(c,v);
+        if(+sl.value!==pos)sl.value=pos;
+      }
+      if(lv){
+        // eval is safe here — cfg.fmt is authored by us in Python, not user input.
+        lv.textContent=(function(v){return eval(c.fmt);})(v);
+      }
+    }
+  }
+  // Presets grid.
   var pg=document.getElementById('pgrid');
   var html='';
   for(var i=1;i<=10;i++){
     var nm=s.presets&&s.presets[i]?s.presets[i].replace(/.*[\\\\/]/,'').replace('.json',''):i;
     var cls=s.presets&&s.presets[i]?' live':'';
-    html+='<div class="pbtn'+cls+'" onclick="sendCmd(\'preset\','+i+')">'+nm+'</div>';
+    html+='<div class="pbtn'+cls+'" onclick="sendCmd(\\'preset\\','+i+')">'+nm+'</div>';
   }
   pg.innerHTML=html;
 }
-function poll(){fetch('/api/state').then(r=>r.json()).then(apply).catch(function(){});}
-poll(); setInterval(poll,500);
+
+// Re-entrancy guard: if the previous poll hasn't finished (slow network,
+// backgrounded tab), skip this tick instead of piling up in-flight requests.
+var polling=false;
+function poll(){
+  if(polling)return;
+  polling=true;
+  fetch('/api/state').then(function(r){return r.json();}).then(function(s){
+    polling=false; apply(s);
+  }).catch(function(){polling=false;});
+}
+buildSliders();
+// 33ms == ~30Hz. Matches Qt's refresh_logic QTimer in titan_gui.py so
+// both windows update at the same cadence during drags.
+poll(); setInterval(poll,33);
 </script>
 </body>
 </html>"""
+
+# Inject the slider config into the HTML template. Done after the literal so
+# the JSON doesn't have to survive Python's triple-quote string escapes.
+_WEB_HTML = _WEB_HTML.replace("__SLIDERS_JSON__", _WEB_SLIDERS_JSON)
 
 
 def start_web_server(port=9000):
@@ -397,21 +545,36 @@ def start_web_server(port=9000):
             def log_message(self, fmt, *args): pass  # suppress per-request stdout noise
 
             def do_GET(self):
-                if self.path in ('/', '/index.html'):
-                    self._html(_WEB_HTML)
-                elif self.path == '/api/state':
-                    self._json(self._state())
-                else:
-                    self.send_response(404); self.end_headers()
+                try:
+                    if self.path in ('/', '/index.html'):
+                        self._html(_WEB_HTML)
+                    elif self.path == '/api/state':
+                        self._json(self._state())
+                    else:
+                        self.send_response(404); self.end_headers()
+                except Exception:
+                    logger.exception(f"Web GET {self.path} failed")
+                    try:
+                        self.send_response(500); self.end_headers()
+                    except Exception:
+                        pass
 
             def do_POST(self):
-                if self.path == '/api/command':
-                    n = int(self.headers.get('Content-Length', 0))
-                    body = json.loads(self.rfile.read(n))
-                    self._handle(body)
-                    self._json(self._state())
-                else:
-                    self.send_response(404); self.end_headers()
+                try:
+                    if self.path == '/api/command':
+                        n = int(self.headers.get('Content-Length', 0))
+                        body = json.loads(self.rfile.read(n))
+                        logger.info(f"Web remote cmd: {body}")
+                        self._handle(body)
+                        self._json(self._state())
+                    else:
+                        self.send_response(404); self.end_headers()
+                except Exception:
+                    logger.exception(f"Web POST {self.path} failed")
+                    try:
+                        self.send_response(500); self.end_headers()
+                    except Exception:
+                        pass
 
             def _html(self, text):
                 data = text.encode('utf-8')
@@ -429,32 +592,77 @@ def start_web_server(port=9000):
 
             def _state(self):
                 pm = app_state.get("preset_map", {})
+                # Audio is considered live if PD emitted an /audio/bands frame
+                # within the last 500 ms. compute_audio_thread writes
+                # pd_last_time = time.time() on every incoming frame.
                 audio_ok = (time.time() - app_state.get("pd_last_time", 0)) < 0.5
+                # Snapshot every param the web UI renders a slider for.
+                # Single pass, so no chance of partial/torn reads across
+                # sliders when used with the drag-lock on the client.
+                web_params = {k: params.get(k) for k in WEB_PARAM_WHITELIST}
                 return {
                     "mute": int(params.get("mute", 0)),
                     "panic": bool(app_state.get("panic_blackout", False)),
-                    "dimmer": float(params.get("master_inhibitive", 1.0)),
-                    "fps": float(app_state.get("current_fps", 0.0)),
-                    "audio_status": app_state.get("osc_in_text", "\u2014"),
                     "audio_ok": audio_ok,
-                    "art_packets": int(app_state.get("art_packets", 0)),
-                    "artnet_active": bool(app_state.get("artnet_active", False)),
+                    "params": web_params,
                     "presets": {int(k): str(v) for k, v in pm.items()},
                 }
 
             def _handle(self, body):
                 cmd, val = body.get("cmd"), body.get("value")
+                # `web_sync_latch` = True tells the Qt refresh_logic to push
+                # the new params into the visual sliders/spinboxes on its
+                # next 33 ms tick. Set by every mutating branch below so the
+                # main GUI stays in lockstep with the web remote.
                 if cmd == "mute":
                     params["mute"] = 1 if val else 0
-                    notify_pd("/mute", int(bool(val)))
+                    # notify_pd whitelists bare names (no leading slash) and
+                    # prepends the slash itself. Passing "/mute" caused the
+                    # whitelist check `if name in PD_INIT_PARAMS` to fail
+                    # silently, so PD never actually muted.
+                    notify_pd("mute", int(bool(val)))
+                    app_state["web_sync_latch"] = True
                 elif cmd == "panic":
                     app_state["panic_blackout"] = bool(val)
+                    app_state["web_sync_latch"] = True
                 elif cmd == "dimmer":
+                    # Legacy 0-255 dimmer path (kept for backward compat with
+                    # older cached versions of the HTML). New HTML uses the
+                    # generic `param` command with key="master_inhibitive".
                     params["master_inhibitive"] = max(0.0, min(1.0, int(val) / 255.0))
+                    app_state["web_sync_latch"] = True
+                elif cmd == "param":
+                    key = body.get("key")
+                    if key not in WEB_PARAM_WHITELIST:
+                        logger.warning(f"Web remote: rejected param write to {key!r} (not in whitelist)")
+                        return
+                    # Clamp to the slider's declared min/max so a malformed
+                    # client can't push e.g. input_trim=999 or hip=-5.
+                    cfg = next((s for s in WEB_SLIDERS if s["key"] == key), None)
+                    if cfg is None:
+                        return
+                    try:
+                        v = float(val)
+                    except (TypeError, ValueError):
+                        logger.warning(f"Web remote: bad value for {key!r}: {val!r}")
+                        return
+                    v = max(cfg["min"], min(cfg["max"], v))
+                    # Preserve int semantics for step>=1 integer params
+                    # (smooth_size, floor, ceiling, hip, lop, atk_*, rel_*).
+                    params[key] = int(round(v)) if cfg.get("step", 0.01) >= 1 else v
+                    # Forward to PD if it's on the init-params whitelist
+                    # (hip, lop, env, test_freq, test_db, input_trim, mute).
+                    # notify_pd internally filters by PD_INIT_PARAMS so this
+                    # is safe to call for every key.
+                    notify_pd(key, params[key])
+                    app_state["web_sync_latch"] = True
                 elif cmd == "preset":
                     f = app_state.get("preset_map", {}).get(int(val))
                     if f:
                         app_state["pending_preset"] = f
+                        app_state["web_sync_latch"] = True
+                else:
+                    logger.warning(f"Web remote: unknown command {cmd!r}")
         return _Handler
 
     class _Server(socketserver.ThreadingTCPServer):
@@ -930,8 +1138,10 @@ if __name__ == "__main__":
         while True:
             try:
                 server = osc_server.ThreadingOSCUDPServer(("127.0.0.1", int(params["osc_in_port"])), disp)
-                'osc_in_port']}")
-
+                if app_state.get("port_conflict_osc"):
+                    logger.info(f"Port {params['osc_in_port']} freed! Resuming Audio Data listener.")
+                else:
+                    logger.info(f"Listening for Audio Data on Port {params['osc_in_port']}")
 
                 app_state["port_conflict_osc"] = False
                 server.serve_forever()
@@ -944,10 +1154,6 @@ if __name__ == "__main__":
 
 
     audio_thread = threading.Thread(target=run_osc_server, daemon=True)
-                if app_state.get("port_conflict_osc"):
-                    logger.info(f"Port {params['osc_in_port']} freed! Resuming Audio Data listener.")
-                else:
-                    logger.info(f"Listening for Audio Data on Port {params[
     audio_thread.start()
 
     compute_thread = threading.Thread(target=compute_audio_thread, daemon=True, name="AudioCompute")
