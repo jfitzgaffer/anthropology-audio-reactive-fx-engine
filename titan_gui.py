@@ -20,14 +20,54 @@ logger = logging.getLogger("TitanEngine")
 
 
 class _SliderWheelFilter(QObject):
-    """Swallow WheelEvents on QSliders so the mouse wheel scrolls the
-    surrounding QScrollArea instead of nudging the slider value."""
+    """Swallow WheelEvents on QSliders, QSpinBoxes, and QDoubleSpinBoxes so
+    the mouse wheel scrolls the surrounding QScrollArea instead of nudging
+    the widget's value. Users were accidentally changing spinbox values just
+    by scrolling past them; steering wheels away from controls matches the
+    behaviour in most other DAW/DMX tools."""
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Wheel:
             # Propagate upward so the scroll area catches it
             event.ignore()
             return True
         return super().eventFilter(obj, event)
+
+
+class _DmxLockFilter(QObject):
+    """Intercepts user-interaction events (mouse press, wheel, key) on
+    widgets that are currently locked out by DMX remote control.
+
+    When the lock is active the widget is still painted (so users can see
+    the live value from incoming DMX frames) but any attempt to change it
+    pops up an explanation dialog with an inline toggle for turning the
+    remote off. Paint / resize / focus events are left untouched so the
+    widget still renders normally."""
+
+    _INTERACTION_EVENTS = (
+        QEvent.MouseButtonPress,
+        QEvent.MouseButtonDblClick,
+        QEvent.Wheel,
+        QEvent.KeyPress,
+    )
+
+    def __init__(self, get_locked, show_popup, parent=None):
+        super().__init__(parent)
+        self._get_locked = get_locked
+        self._show_popup = show_popup
+
+    def eventFilter(self, obj, event):
+        if not self._get_locked():
+            return False
+        if event.type() in self._INTERACTION_EVENTS:
+            # Consume the event and surface the popup. The popup itself
+            # guards against re-entry so rapid clicks don't spawn a stack.
+            self._show_popup()
+            return True
+        # Silently swallow release/move events while locked so Qt doesn't
+        # think a drag is in progress — but don't reopen the popup.
+        if event.type() in (QEvent.MouseButtonRelease, QEvent.MouseMove):
+            return True
+        return False
 
 
 # Change the order so QObject is first
@@ -110,8 +150,15 @@ class TitanQtGUI(QObject):
         self.ui = loader.load(ui_file)
         ui_file.close()
 
-        # Hide obsolete Base Mix UI elements automatically if they exist
-        for widget_name in ["sld_base_mix", "spin_base_mix", "lbl_base_mix"]:
+        # Hide obsolete Base Mix UI elements if they're still in the .ui file.
+        # The Designer name for the caption is `label_base_mix` (not
+        # `lbl_base_mix`), so the original list was silently missing it —
+        # which is why the stale "Base Mix" caption was still showing up in
+        # the Dynamics tab. Include both spellings for forward compatibility.
+        for widget_name in [
+            "sld_base_mix", "spin_base_mix",
+            "lbl_base_mix", "label_base_mix",
+        ]:
             if hasattr(self.ui, widget_name):
                 getattr(self.ui, widget_name).hide()
 
@@ -263,13 +310,22 @@ class TitanQtGUI(QObject):
         for box in self.ui.findChildren(QGroupBox):
             box.setMaximumHeight(16777215)
 
-        # Disable scroll-wheel on every QSlider so the wheel scrolls the
-        # containing QScrollArea instead of accidentally nudging a value.
-        # Keep a strong reference on self so Qt doesn't GC the filter.
+        # Disable scroll-wheel on every QSlider, QSpinBox, and QDoubleSpinBox
+        # so the wheel scrolls the containing QScrollArea instead of
+        # accidentally nudging a value when the cursor happens to be over a
+        # control. Keep a strong reference on self so Qt doesn't GC the
+        # filter. StrongFocus means wheel only fires once the widget has
+        # focus, which belt-and-braces backs up the filter above.
         self._slider_wheel_filter = _SliderWheelFilter(self.ui)
         for sld in self.ui.findChildren(QSlider):
             sld.installEventFilter(self._slider_wheel_filter)
-            sld.setFocusPolicy(Qt.StrongFocus)  # wheel only fires when slider has focus
+            sld.setFocusPolicy(Qt.StrongFocus)
+        for spin in self.ui.findChildren(QSpinBox):
+            spin.installEventFilter(self._slider_wheel_filter)
+            spin.setFocusPolicy(Qt.StrongFocus)
+        for dspin in self.ui.findChildren(QDoubleSpinBox):
+            dspin.installEventFilter(self._slider_wheel_filter)
+            dspin.setFocusPolicy(Qt.StrongFocus)
 
         # Step 2 — wrap each tab page in a QScrollArea. We move the tab's
         # existing layout onto a fresh `inner` container, install that
@@ -463,11 +519,54 @@ class TitanQtGUI(QObject):
 
     def _on_audio_device_changed(self, _idx):
         self.params["pd_audio_dev"] = self.cmb_audio_dev.currentData()
+        self._check_audio_device_collision()
         self._restart_pd_with_current_devices()
 
     def _on_audio_output_device_changed(self, _idx):
         self.params["pd_audio_dev_out"] = self.cmb_audio_dev_out.currentData()
+        self._check_audio_device_collision()
         self._restart_pd_with_current_devices()
+
+    def _check_audio_device_collision(self):
+        """Warn when the user has picked the same physical device for PD's
+        input and output.
+
+        Using one device for both sides produces a feedback loop in nearly
+        every driver: PD opens it twice at potentially different sample
+        rates, which at best crashes PD on launch and at worst routes the
+        output tone straight back into the RMS meter and floods the lights.
+        The one legitimate case is intentional loopback (BlackHole, Soundflower)
+        but users rarely configure that by accident — so we warn and let
+        them dismiss it.
+
+        Guarded against repeat warnings: we remember the (in_id, out_id)
+        pair we last warned about so toggling back and forth between other
+        devices doesn't spam a modal on every change."""
+        in_id = self.cmb_audio_dev.currentData() if hasattr(self, 'cmb_audio_dev') else None
+        out_id = self.cmb_audio_dev_out.currentData() if hasattr(self, 'cmb_audio_dev_out') else None
+        if in_id is None or out_id is None:
+            return
+        if in_id != out_id:
+            self._last_device_collision_warned = None
+            return
+        # Same device picked for both sides. Only warn once per collision.
+        if getattr(self, '_last_device_collision_warned', None) == (in_id, out_id):
+            return
+        self._last_device_collision_warned = (in_id, out_id)
+
+        in_name = self.cmb_audio_dev.currentText()
+        QMessageBox.warning(
+            self.ui,
+            "Input and output use the same device",
+            (
+                f"Pure Data is configured to use \"{in_name}\" for both its "
+                f"audio input and its audio output.\n\n"
+                "This will almost always cause a feedback loop or crash PD "
+                "on launch. If you meant to loop audio (e.g. BlackHole or "
+                "Soundflower) you can ignore this warning — otherwise pick "
+                "a different output device."
+            ),
+        )
 
     def _restart_pd_with_current_devices(self):
         if getattr(self, "_watchdog", None) is None:
@@ -891,6 +990,9 @@ class TitanQtGUI(QObject):
             elif obj == getattr(self, 'lbl_stat_test', None):
                 self._show_test_troubleshoot()
                 return True
+            elif obj == getattr(self, 'lbl_stat_web', None):
+                self._show_web_remote_qr()
+                return True
 
         # This MUST sit outside the MouseButtonPress block!
         return super().eventFilter(obj, event)
@@ -951,6 +1053,77 @@ class TitanQtGUI(QObject):
         else:
             QMessageBox.information(self.ui, "Test Tone",
                                     "The Test Tone is off. The engine is listening to live audio.")
+
+    def _show_web_remote_qr(self):
+        """Pop up a dialog with a scannable QR code of the web-remote URL so
+        the gaffer can hand a phone to anyone in the room instead of reading
+        an IP/port out loud.
+
+        Falls back to a plain-text URL and a short install hint when the
+        `qrcode` package isn't importable — nothing in the rest of the app
+        depends on it so we don't want a missing module to kill the popup."""
+        web_ip = self.app_state.get("web_ip")
+        web_port = self.app_state.get("web_port")
+        if not web_ip or not web_port:
+            QMessageBox.information(
+                self.ui,
+                "Web Remote",
+                "The web remote server is still starting up. Try again in a moment.",
+            )
+            return
+        url = f"http://{web_ip}:{web_port}"
+
+        dlg = QDialog(self.ui)
+        dlg.setWindowTitle("Web Remote — Scan to Open")
+        lay = QVBoxLayout(dlg)
+
+        lbl_url = QLabel(f"<b>{url}</b>")
+        lbl_url.setAlignment(Qt.AlignCenter)
+        lbl_url.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        lay.addWidget(lbl_url)
+
+        # Try to build the QR as a QPixmap. `qrcode` renders PIL Images; we
+        # convert via PNG bytes in-memory so we never hit disk.
+        try:
+            import io
+            import qrcode
+            from PySide6.QtGui import QPixmap
+
+            img = qrcode.make(url)  # default version/ec; autosizes for URL length
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            pix = QPixmap()
+            pix.loadFromData(buf.getvalue(), "PNG")
+
+            lbl_qr = QLabel()
+            lbl_qr.setPixmap(pix.scaledToWidth(320, Qt.SmoothTransformation))
+            lbl_qr.setAlignment(Qt.AlignCenter)
+            lay.addWidget(lbl_qr)
+
+            lay.addWidget(QLabel(
+                "Point a phone camera at the QR above, or browse to the URL "
+                "manually. The device must be on the same network as this "
+                "machine."
+            ))
+        except Exception as e:
+            logger.warning(f"QR generation failed ({e}); falling back to text.")
+            hint = QLabel(
+                "QR rendering requires the `qrcode` Python module, which is "
+                "not installed in this environment.\n\n"
+                "Install it with:\n"
+                f"    {sys.executable} -m pip install qrcode\n\n"
+                "Meanwhile, browse to the URL above from any device on the "
+                "same network."
+            )
+            hint.setWordWrap(True)
+            lay.addWidget(hint)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Close)
+        btns.rejected.connect(dlg.reject)
+        btns.accepted.connect(dlg.accept)
+        lay.addWidget(btns)
+
+        dlg.exec()
 
     def _setup_menubar(self):
         menubar = getattr(self.ui, "menubar", None)
@@ -1817,6 +1990,16 @@ class TitanQtGUI(QObject):
                 orig.hide()
         self.ui.spin_ctrl_univ = new_spin_ctrl_univ
 
+        # Hide the Art-Net port spinbox (and its label). Art-Net = 6454 and
+        # sACN = 5568 are hardcoded by their respective specs; exposing an
+        # editable "port" field just invited support tickets from users who
+        # bumped the value by accident. main_v5.01.py now always sends to
+        # 6454, independent of what's in params["art_port"].
+        for attr in ("spin_art_port", "label_17"):
+            orig = getattr(self.ui, attr, None)
+            if orig is not None:
+                orig.hide()
+
         layout.addWidget(QLabel("Proto:"), 0, 0)
         layout.addWidget(self.cmb_protocol, 0, 1)
         layout.addWidget(QLabel("Mode:"), 0, 2)
@@ -1991,8 +2174,16 @@ class TitanQtGUI(QObject):
 
         row_web = QHBoxLayout()
         self.lbl_stat_web = QLabel("starting…")
-        self.lbl_stat_web.setStyleSheet("color: #5588ff; font-size: 11px;")
+        # Style as a clickable hyperlink (underline + pointer cursor). Clicking
+        # the text opens a popup with a scannable QR code so the director can
+        # just show a cast member their phone-facing camera instead of
+        # dictating an IP address.
+        self.lbl_stat_web.setStyleSheet(
+            "color: #5588ff; font-size: 11px; text-decoration: underline;"
+        )
+        self.lbl_stat_web.setCursor(Qt.PointingHandCursor)
         self.lbl_stat_web.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.lbl_stat_web.installEventFilter(self)  # eventFilter handles the click
         row_web.addWidget(QLabel("Web Remote:"))
         row_web.addWidget(self.lbl_stat_web)
         l.addLayout(row_web)
@@ -2372,34 +2563,136 @@ class TitanQtGUI(QObject):
         # 2. Lock or unlock the GUI sliders
         self._apply_remote_lock(checked)
 
-    def _apply_remote_lock(self, is_locked):
-        # 1. ONLY lock the parameters that QLC+ actually controls via DMX
-        dmx_controlled_sliders = [
-            "master_inhibitive", "dimmer",
-            "color_r", "color_g", "color_b", "color_w",
-            "skew", "width",
-            "glitch_ana_amt", "glitch_digi_amt", "od_glitch",
-            "bg_dimmer", "bg_r", "bg_g", "bg_b", "bg_w"
-        ]
+    # Params that incoming DMX writes to. When remote control is active
+    # these widgets stay visible (so the user can watch the live value) but
+    # any interaction is intercepted and produces an explanation popup.
+    _DMX_CONTROLLED_PARAMS = [
+        "master_inhibitive", "dimmer",
+        "color_r", "color_g", "color_b", "color_w",
+        "skew", "width",
+        "glitch_ana_amt", "glitch_digi_amt", "od_glitch",
+        "bg_dimmer", "bg_r", "bg_g", "bg_b", "bg_w",
+    ]
+    _DMX_CONTROLLED_CHECKS = [
+        "master_ana_force_off", "master_ana_force_on",
+        "master_digi_force_off", "master_digi_force_on",
+        "master_od_force_off", "master_od_force_on",
+    ]
 
-        # Lock/Unlock ONLY those specific sliders and spinboxes
-        for name in dmx_controlled_sliders:
+    def _collect_dmx_locked_widgets(self):
+        """Return the list of widgets that should be greyed out and
+        interaction-blocked while DMX remote control is on."""
+        widgets = []
+        for name in self._DMX_CONTROLLED_PARAMS:
             sld = getattr(self.ui, f"sld_{name}", None)
             spin = getattr(self.ui, f"spin_{name}",
-                           self.dyn_widgets.get(f"spin_{name}", None) if hasattr(self, 'dyn_widgets') else None)
+                           self.dyn_widgets.get(f"spin_{name}", None)
+                           if hasattr(self, 'dyn_widgets') else None)
+            if sld:
+                widgets.append(sld)
+            if spin:
+                widgets.append(spin)
+        for chk_name in self._DMX_CONTROLLED_CHECKS:
+            chk = getattr(self, f"chk_{chk_name}",
+                          getattr(self.ui, f"chk_{chk_name}", None))
+            if chk:
+                widgets.append(chk)
+        return widgets
 
-            if sld: sld.setEnabled(not is_locked)
-            if spin: spin.setEnabled(not is_locked)
+    def _apply_remote_lock(self, is_locked):
+        """When DMX remote control is enabled, grey out the widgets that
+        external DMX drives and install an interaction filter that opens a
+        popup if the user tries to touch one.
 
-        # 2. Lock/Unlock the master effect checkboxes (also DMX controlled)
-        master_chks = [
-            "master_ana_force_off", "master_ana_force_on",
-            "master_digi_force_off", "master_digi_force_on",
-            "master_od_force_off", "master_od_force_on"
-        ]
-        for chk_name in master_chks:
-            chk = getattr(self, f"chk_{chk_name}", getattr(self.ui, f"chk_{chk_name}", None))
-            if chk: chk.setEnabled(not is_locked)
+        We deliberately keep the widgets *enabled* at the Qt level — a
+        disabled widget blocks events outright, which would also kill the
+        click → popup handoff. Instead we fake the grey-out with a
+        QGraphicsOpacityEffect and rely on the event filter to catch and
+        explain interactions.
+        """
+        # One-shot construction of the shared filter + effect map. Held on
+        # self so Qt doesn't GC them while they're still installed.
+        if not hasattr(self, '_dmx_lock_filter'):
+            self._dmx_lock_filter = _DmxLockFilter(
+                get_locked=lambda: bool(int(self.params.get("remote_on", 1))),
+                show_popup=self._show_remote_lock_popup,
+                parent=self.ui,
+            )
+        if not hasattr(self, '_dmx_lock_effects'):
+            self._dmx_lock_effects = {}
+
+        from PySide6.QtWidgets import QGraphicsOpacityEffect  # local to keep top imports tidy
+
+        widgets = self._collect_dmx_locked_widgets()
+        for w in widgets:
+            # Filter install is idempotent (Qt deduplicates internally) but
+            # we remove first so toggling on→off→on doesn't stack filters.
+            w.removeEventFilter(self._dmx_lock_filter)
+            if is_locked:
+                w.installEventFilter(self._dmx_lock_filter)
+                # Apply / refresh the opacity effect so the widget reads as
+                # visually inactive. We cache the QGraphicsOpacityEffect per
+                # widget so toggling doesn't leak effect objects.
+                eff = self._dmx_lock_effects.get(id(w))
+                if eff is None:
+                    eff = QGraphicsOpacityEffect(w)
+                    self._dmx_lock_effects[id(w)] = eff
+                eff.setOpacity(0.35)
+                w.setGraphicsEffect(eff)
+            else:
+                # Remove the grey-out. Setting the effect to None detaches
+                # it without deleting the cached instance, which we'll
+                # reuse the next time the lock engages.
+                w.setGraphicsEffect(None)
+
+    def _show_remote_lock_popup(self):
+        """Explain why a DMX-controlled slider won't respond and offer an
+        inline toggle for disabling remote control so the user can take
+        over from the GUI without hunting through the menu for the switch.
+
+        Guarded against re-entry — rapid clicks on a locked slider would
+        otherwise stack dialogs."""
+        if getattr(self, '_lock_popup_open', False):
+            return
+        self._lock_popup_open = True
+        try:
+            dlg = QDialog(self.ui)
+            dlg.setWindowTitle("DMX Remote Control is Active")
+            dlg.setMinimumWidth(420)
+            lay = QVBoxLayout(dlg)
+
+            msg = QLabel(
+                "This parameter is currently being driven by incoming DMX "
+                "from an external controller (QLC+, a console, etc.).\n\n"
+                "Any change you make here will be overwritten the next time "
+                "a DMX frame arrives. To take manual control, disable DMX "
+                "remote control below."
+            )
+            msg.setWordWrap(True)
+            lay.addWidget(msg)
+
+            chk = QCheckBox("Enable DMX Remote Control")
+            chk.setChecked(bool(int(self.params.get("remote_on", 1))))
+
+            def on_toggled(checked):
+                # Mirror the main Control menu toggle so all state stays in
+                # lockstep (params, menu check, and the GUI lock itself).
+                if hasattr(self, 'act_remote_lock'):
+                    self.act_remote_lock.blockSignals(True)
+                    self.act_remote_lock.setChecked(checked)
+                    self.act_remote_lock.blockSignals(False)
+                self._on_remote_toggled(checked)
+
+            chk.toggled.connect(on_toggled)
+            lay.addWidget(chk)
+
+            btn_close = QPushButton("Close")
+            btn_close.clicked.connect(dlg.accept)
+            lay.addWidget(btn_close)
+
+            dlg.exec()
+        finally:
+            self._lock_popup_open = False
 
     def _toggle_live_update(self, state):
         self.live_update = state

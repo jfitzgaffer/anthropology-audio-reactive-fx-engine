@@ -5,6 +5,65 @@ All notable changes to Titan Engine are documented here. Format follows
 
 ## [Unreleased]
 
+### [2026-04-24] - Panic fade, DMX lock popup, spinbox wheel lock, QR remote, device collision warning, port field removal
+
+#### Added
+- **Panic blackout now fades instead of cutting.** `app_state` gained
+  `panic_level` / `panic_target` / `panic_last_tick`. `compute_audio_thread`
+  slews `panic_level` toward `panic_target` each frame using the master fade
+  timings — `dimmer_rel` ms for the ramp to black, `dimmer_atk` ms for the
+  ramp back up — so the panic cue feels like a scripted dimmer fade instead
+  of an abrupt cut. Every output byte (both the per-universe `buffers` and
+  the control-universe `fb_payload`) is scaled by `panic_level`; we
+  short-circuit when the level is near 1.0 so normal operation pays zero
+  cost. Both the GUI button and the web-remote panic toggle drive the same
+  state so the fade plays the same way from either origin.
+- **DMX remote lock popup.** When DMX remote control is enabled, touching a
+  DMX-driven slider/spinbox/checkbox now opens a dialog explaining that
+  external DMX is in control and offering an inline *Enable DMX Remote
+  Control* checkbox that toggles the lock without forcing the user to hunt
+  through the Control menu. New `_DmxLockFilter` intercepts MouseButtonPress,
+  MouseButtonDblClick, Wheel, and KeyPress events on locked widgets, swallows
+  MouseMove/Release so drags don't register, and surfaces the popup.
+  Re-entry guarded so rapid clicks don't stack dialogs.
+- **Grayed-out rendering for DMX-locked widgets.** Rather than
+  `setEnabled(False)` (which would block the click → popup handoff), each
+  locked widget gets a `QGraphicsOpacityEffect` at 35% opacity. The effect
+  is cached per-widget so toggling remote control on/off doesn't leak
+  effect objects.
+- **Scannable QR code for the Web Remote URL.** Clicking the blue
+  `Web Remote: http://…` link in the Status box now opens a dialog
+  containing a QR code the director can point a phone camera at. The QR is
+  generated in-memory via the `qrcode` Python module (newly added
+  dependency) and rendered as a `QPixmap`; when the module isn't importable
+  the dialog gracefully falls back to plain text plus an install hint.
+- **Audio device collision warning.** `_on_audio_device_changed` and
+  `_on_audio_output_device_changed` now run `_check_audio_device_collision()`
+  which warns via `QMessageBox.warning` when PD's input and output are
+  pointed at the same physical device. De-duped per (in_id, out_id) pair so
+  the modal doesn't re-open when flipping between other devices. The one
+  legitimate use-case (BlackHole/Soundflower loopback) is called out in the
+  message.
+
+#### Fixed
+- **Scroll wheel no longer nudges spinboxes either.** The wheel filter is
+  now also installed on every `QSpinBox` and `QDoubleSpinBox` via
+  `findChildren`, so hovering over a value and scrolling past it no longer
+  changes the value. `StrongFocus` policy applied to all three widget
+  families as a belt-and-braces backup.
+- **Stale "Base Mix" caption removed from Dynamics tab.** The cleanup list
+  in `__init__` was looking for `lbl_base_mix` while the Designer name is
+  `label_base_mix`, so the caption was never actually hidden. Fixed by
+  including both spellings in the hide list.
+
+#### Changed
+- **Art-Net port field removed from the GUI.** The Art-Net spec fixes the
+  wire port at 6454 (and sACN at 5568); an editable field only ever caused
+  support tickets. `spin_art_port` and its "Port:" label are hidden at
+  runtime in `_setup_protocol_ui`, and `main_v5.01.py` now always sends to
+  port 6454 regardless of any legacy value stored in
+  `params["art_port"]`/autosave.
+
 ### [2026-04-24] - Slider scroll fix, 44 Hz FPS cap, independent calibration phases, Network Config tab
 
 #### Fixed

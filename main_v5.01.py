@@ -223,6 +223,17 @@ app_state = {
     # so fixtures actively go dark — we can't just halt transmission because
     # most DMX consoles hold their last frame when the packet stream stops.
     "panic_blackout": False,
+    # Panic fade state. `panic_level` is the scalar (0.0..1.0) actually
+    # applied to every output byte each frame. `panic_target` is where it's
+    # heading: 0.0 while panic_blackout is engaged, 1.0 while released.
+    # compute_audio_thread slews panic_level toward panic_target using the
+    # master fade timings — `dimmer_rel` ms for the ramp to black, and
+    # `dimmer_atk` ms for the ramp back up — so panic feels like a scripted
+    # cue fade instead of an abrupt cut. panic_last_tick is the monotonic
+    # timestamp of the previous slew step.
+    "panic_level": 1.0,
+    "panic_target": 1.0,
+    "panic_last_tick": 0.0,
 }
 
 engine = RenderEngine()
@@ -828,10 +839,45 @@ def compute_audio_thread():
 
             buffers = engine.process_audio(total_db, bass_db, treble_db, params)
 
-            if app_state.get("panic_blackout"):
-                zero = bytes(512)
-                for u in buffers:
-                    buffers[u] = zero
+            # --- Panic blackout fade ---
+            # The panic button flips `panic_blackout` in app_state. We translate
+            # that into a target level (0.0 when engaged, 1.0 when released) and
+            # slew `panic_level` toward it using the master fade timings:
+            # `dimmer_rel` ms when fading down to black, `dimmer_atk` ms when
+            # fading back up. The fade is dt-based so it still plays out at the
+            # right speed even though compute_audio_thread only runs at ~44 Hz.
+            panic_target = 0.0 if app_state.get("panic_blackout") else 1.0
+            app_state["panic_target"] = panic_target
+            panic_level = float(app_state.get("panic_level", 1.0))
+            last_tick = float(app_state.get("panic_last_tick", 0.0))
+            dt = _MIN_FRAME_INTERVAL if last_tick == 0.0 else max(0.0, now - last_tick)
+            app_state["panic_last_tick"] = now
+
+            if abs(panic_level - panic_target) > 1e-4:
+                # Fading down uses dimmer_rel; fading up uses dimmer_atk. Both
+                # are expressed in ms on the same sliders used for per-fixture
+                # dimmer fades, so the panic ramp matches the rest of the rig.
+                fade_ms = float(params.get("dimmer_rel", 500)) if panic_target < panic_level \
+                    else float(params.get("dimmer_atk", 50))
+                coef = min(1.0, (dt * 1000.0) / max(1.0, fade_ms))
+                panic_level += (panic_target - panic_level) * coef
+            else:
+                panic_level = panic_target
+            app_state["panic_level"] = panic_level
+
+            # Apply the scalar. When panic_level is essentially 1.0 we skip the
+            # per-byte loop so normal operation is zero-cost. When it's at the
+            # floor we short-circuit to all-zero bytes to avoid a trailing 1
+            # from floating-point rounding keeping fixtures barely lit.
+            if panic_level < 0.999:
+                if panic_level < 0.001:
+                    zero = bytes(512)
+                    for u in list(buffers.keys()):
+                        buffers[u] = zero
+                else:
+                    scale = panic_level
+                    for u in list(buffers.keys()):
+                        buffers[u] = bytes(int(b * scale) for b in buffers[u])
 
             if now - app_state["packet_reset_time"] > 60.0:
                 app_state["art_packets"] = 0
@@ -846,7 +892,10 @@ def compute_audio_thread():
                 "is_sacn": is_sacn,
                 "net_mode": params.get("net_mode", "Unicast"),
                 "base_ip": str(params.get("art_ip", "127.0.0.1")).strip(),
-                "target_port": 5568 if is_sacn else int(params.get("art_port", 6454)),
+                # Art-Net = 6454, sACN = 5568. Both are hardcoded by their
+                # specs, so we ignore any legacy `art_port` value that may
+                # still be in params/autosave from pre-spec-hardcode saves.
+                "target_port": 5568 if is_sacn else 6454,
                 "priority": int(params.get("sacn_priority", 100)),
                 "src_name": str(params.get("sacn_src", "Titan Engine")),
                 "is_preview": int(params.get("sacn_preview", 0)) == 1,
@@ -901,8 +950,14 @@ def compute_audio_thread():
 
             fb_payload[510] = 0  # (Previously Base Mix)
 
-            if app_state.get("panic_blackout"):
-                fb_payload = [0] * 512
+            # Scale the feedback payload by the same panic_level computed above
+            # so what the control-universe listener sees matches what the wire
+            # is carrying. Same short-circuits: ~1.0 = no-op, ~0.0 = zero all.
+            if panic_level < 0.999:
+                if panic_level < 0.001:
+                    fb_payload = [0] * 512
+                else:
+                    fb_payload = [int(v * panic_level) for v in fb_payload]
 
             job = {"buffers": buffers, "fb_payload": fb_payload, "cfg": cfg}
             try:
