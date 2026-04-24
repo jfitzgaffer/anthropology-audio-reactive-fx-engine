@@ -5,6 +5,42 @@ All notable changes to Titan Engine are documented here. Format follows
 
 ## [Unreleased]
 
+### [2026-04-24] - Slider scroll fix, 44 Hz FPS cap, independent calibration phases, Network Config tab
+
+#### Fixed
+- **Scroll wheel no longer accidentally moves sliders.** A `_SliderWheelFilter`
+  event filter is installed on every `QSlider` in `_make_tabs_scrollable`.
+  When the mouse wheel fires on a slider, the event is marked `ignored` and
+  propagates up to the enclosing `QScrollArea`, which scrolls the pane as the
+  user intended. Sliders still respond to wheel when they own keyboard focus
+  (`StrongFocus` policy preserved).
+- **Engine no longer wastes CPU at 80-90 Hz.** A smaller PD envelope window
+  (`env=512`) makes Pure Data emit OSC frames faster than Art-Net / sACN can
+  consume them (protocol hard ceiling: 44 Hz). `compute_audio_thread` now
+  enforces a `1/44 s` minimum inter-frame interval and silently discards
+  surplus frames. The DMX wire rate is unchanged; only redundant Python-side
+  DSP calls are eliminated.
+- **Auto Calibrate no longer suggests `env=512`**; the envelope window is left
+  at the user's current setting to avoid triggering the above problem.
+
+#### Changed
+- **Calibration phases are now independent.** The single "Auto Calibrate"
+  button is replaced by two side-by-side buttons in the Input Stage header:
+  *📊 Measure Noise* and *🎙️ Voice & Apply*. Each phase can be triggered
+  individually. Voice capture runs with a stored noise result if one exists;
+  if not, it warns the user and falls back to a conservative 40 dB default so
+  voice capture is never blocked by a missing noise measurement. A status
+  label below the buttons shows the last noise floor reading.
+- **"Control Universe" spinbox moved to Network Config tab.** Previously on
+  the Remote Control tab alongside preset mappings, it now lives in the
+  Network Output Settings grid with the other networking controls
+  (protocol, mode, sACN priority, QLC+ offset). The original widget in
+  the Remote Control tab is hidden; `_link_widgets` is redirected to the
+  new widget automatically.
+- **Output tab renamed to "Network Config".** The "5. Output" tab in
+  `settings_tabs` is renamed to "5. Network Config" at runtime so the tab
+  label matches its contents.
+
 ### [2026-04-20] - Auto-calibration wizard + scrollable settings panes + main-branch rule
 
 #### Added

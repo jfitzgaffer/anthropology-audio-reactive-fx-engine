@@ -792,13 +792,30 @@ def handle_audio(unused_addr, total_db, bass_db, treble_db):
             pass
 
 
+_DMX_MAX_HZ = 44          # Art-Net / sACN hard ceiling per the spec
+_MIN_FRAME_INTERVAL = 1.0 / _DMX_MAX_HZ   # ~22.7 ms
+_last_compute_time = 0.0  # module-level so the thread function can update it
+
+
 def compute_audio_thread():
-    """Drains audio_queue, runs DSP, builds the send job, queues it for the sender."""
+    """Drains audio_queue, runs DSP, builds the send job, queues it for the sender.
+
+    Frames that arrive faster than 44 Hz are silently dropped here — PD can
+    produce 80-90 fps when env is small (e.g. 512 samples), but the DMX wire
+    protocol can't consume more than 44 frames/s, so processing the extra
+    frames only wastes CPU.
+    """
+    global _last_compute_time
     while True:
         try:
             total_db, bass_db, treble_db = audio_queue.get()
 
             now = time.time()
+
+            # Rate-limit to 44 Hz: skip frames that arrive too quickly.
+            if now - _last_compute_time < _MIN_FRAME_INTERVAL:
+                continue
+            _last_compute_time = now
             if now - app_state.get("preset_text_time", 0) < 3.0:
                 pass
             elif now - app_state.get("last_ctrl_time", 0) < 3.5:

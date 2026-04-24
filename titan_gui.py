@@ -19,6 +19,17 @@ from titan_widgets import DMXGridOverlay, FixturePatchWidget
 logger = logging.getLogger("TitanEngine")
 
 
+class _SliderWheelFilter(QObject):
+    """Swallow WheelEvents on QSliders so the mouse wheel scrolls the
+    surrounding QScrollArea instead of nudging the slider value."""
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Wheel:
+            # Propagate upward so the scroll area catches it
+            event.ignore()
+            return True
+        return super().eventFilter(obj, event)
+
+
 # Change the order so QObject is first
 class QtLogHandler(QObject, logging.Handler):
     new_log = Signal(str)
@@ -192,29 +203,48 @@ class TitanQtGUI(QObject):
             self.ui.InputState.layout().insertWidget(0, self.ui.chk_mute)
 
     def _setup_calibrate_button(self):
-        """Add the Auto Calibrate button to the top of the '1. Input Stage'
-        group, above the Gain / Highpass / Lowpass / Envelope sliders. Runs
-        after _setup_mute_ui, so the mute checkbox ends up directly below
-        the calibrate button."""
+        """Add two independent calibration buttons at the top of '1. Input Stage':
+        📊 Noise Floor  |  🎙️ Voice & Apply
+        Either phase can be run independently. The status label between runs
+        shows whether a valid noise result is already stored."""
         if not (hasattr(self.ui, 'InputState') and self.ui.InputState.layout()):
-            logger.warning("InputState group missing; Auto Calibrate button not attached.")
+            logger.warning("InputState group missing; calibration buttons not attached.")
             return
 
-        self.btn_auto_calibrate = QPushButton("🎚️ Auto Calibrate for Voice")
-        self.btn_auto_calibrate.setStyleSheet(
-            "QPushButton { background-color: #2d5a88; color: white; font-weight: bold; "
-            "padding: 8px; border-radius: 4px; } "
-            "QPushButton:hover { background-color: #3d7ab8; } "
-            "QPushButton:disabled { background-color: #444; color: #888; }"
+        _btn_style = (
+            "QPushButton {{ background-color: {bg}; color: white; font-weight: bold; "
+            "padding: 7px; border-radius: 4px; }} "
+            "QPushButton:hover {{ background-color: {hover}; }} "
+            "QPushButton:disabled {{ background-color: #444; color: #888; }}"
         )
-        self.btn_auto_calibrate.setToolTip(
-            "Walks you through a two-step wizard that measures noise, then voice, "
-            "and auto-sets floor/ceiling/trim/filters so lights react to the actor."
+
+        self.btn_cal_noise = QPushButton("📊 Measure Noise")
+        self.btn_cal_noise.setStyleSheet(_btn_style.format(bg="#5a4a2d", hover="#8a6a3d"))
+        self.btn_cal_noise.setToolTip(
+            "Measure ambient room noise for ~6 s with the actor silent.\n"
+            "Run this first so the voice phase knows where silence ends."
         )
-        self.btn_auto_calibrate.clicked.connect(self._launch_calibration_wizard)
-        # Index 0 puts this above the mute checkbox inserted by _setup_mute_ui,
-        # which is the visual top of the Input Stage group.
-        self.ui.InputState.layout().insertWidget(0, self.btn_auto_calibrate)
+        self.btn_cal_noise.clicked.connect(self._cal_start_noise_independent)
+
+        self.btn_cal_voice = QPushButton("🎙️ Voice & Apply")
+        self.btn_cal_voice.setStyleSheet(_btn_style.format(bg="#2d5a88", hover="#3d7ab8"))
+        self.btn_cal_voice.setToolTip(
+            "Measure the actor's voice for ~12 s, then show proposed parameters.\n"
+            "Can run without a prior noise measurement (uses a conservative default)."
+        )
+        self.btn_cal_voice.clicked.connect(self._cal_start_voice_independent)
+
+        self.lbl_cal_status = QLabel("")
+        self.lbl_cal_status.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.lbl_cal_status.setAlignment(Qt.AlignCenter)
+
+        row = QHBoxLayout()
+        row.addWidget(self.btn_cal_noise)
+        row.addWidget(self.btn_cal_voice)
+
+        layout = self.ui.InputState.layout()
+        layout.insertLayout(0, row)
+        layout.insertWidget(1, self.lbl_cal_status)
 
     def _make_tabs_scrollable(self):
         """Make the settings panes grow with their content and add a scroll
@@ -232,6 +262,14 @@ class TitanQtGUI(QObject):
         # horizontal layouts inside each group, so we leave them alone.
         for box in self.ui.findChildren(QGroupBox):
             box.setMaximumHeight(16777215)
+
+        # Disable scroll-wheel on every QSlider so the wheel scrolls the
+        # containing QScrollArea instead of accidentally nudging a value.
+        # Keep a strong reference on self so Qt doesn't GC the filter.
+        self._slider_wheel_filter = _SliderWheelFilter(self.ui)
+        for sld in self.ui.findChildren(QSlider):
+            sld.installEventFilter(self._slider_wheel_filter)
+            sld.setFocusPolicy(Qt.StrongFocus)  # wheel only fires when slider has focus
 
         # Step 2 — wrap each tab page in a QScrollArea. We move the tab's
         # existing layout onto a fresh `inner` container, install that
@@ -483,53 +521,49 @@ class TitanQtGUI(QObject):
         ("lop", "Low-pass", lambda v: f"{v:.0f} Hz"),
         ("expand", "Expand", lambda v: f"{v:.2f}"),
         ("knee", "Knee", lambda v: f"{v:.3f}"),
-        ("env", "Env Window", lambda v: f"{v:.0f}"),
         ("drive", "Drive", lambda v: f"{v:.2f}"),
     ]
 
-    def _launch_calibration_wizard(self):
-        """Start the two-phase voice calibration flow.
+    def _cal_get_calibrator(self, action="calibrate"):
+        """Retrieve the calibrator from callbacks; show error and return None if absent."""
+        cal = self.callbacks.get("calibrator") if self.callbacks else None
+        if cal is None:
+            QMessageBox.warning(self.ui, "Calibration",
+                                "Calibrator is not wired up (no calibrator in callbacks).")
+            return None
+        if cal.is_capturing:
+            QMessageBox.information(self.ui, "Calibration",
+                                    "A calibration capture is already running.")
+            return None
+        return cal
 
-        Phase 1 asks the room to be silent, captures noise. Phase 2 asks the
-        actor to speak, captures voice. On success, a summary dialog shows
-        proposed params; the user clicks Apply to commit them.
-        """
-        calibrator = self.callbacks.get("calibrator") if self.callbacks else None
-        if calibrator is None:
-            QMessageBox.warning(self.ui, "Auto Calibrate",
-                                "Calibration is not wired up (no calibrator in callbacks).")
+    def _cal_start_noise_independent(self):
+        """Run only the noise-floor phase. Stores result so voice can use it later."""
+        cal = self._cal_get_calibrator()
+        if cal is None:
             return
-        if calibrator.is_capturing:
-            QMessageBox.information(self.ui, "Auto Calibrate",
-                                    "A calibration run is already in progress.")
-            return
-        self._cal_phase1(calibrator)
-
-    def _cal_phase1(self, calibrator):
-        # Intro dialog. We want to give the user a chance to tell the room
-        # to quiet down before we start sampling.
         proceed = QMessageBox.question(
             self.ui,
-            "Step 1 / 2 — Measure Noise Floor",
-            f"<b>Have the actor stay silent for {calibrator.noise_duration:.0f} seconds.</b><br><br>"
-            "The engine will measure the ambient room noise so it knows where "
-            "real voice begins. Keep the environment as quiet as performance "
-            "conditions — background music, HVAC, crowd hum all count as noise.<br><br>"
-            "Ready?",
+            "Measure Noise Floor",
+            f"<b>Actor must stay silent for {cal.noise_duration:.0f} s.</b><br><br>"
+            "The engine samples the ambient room noise so it can distinguish "
+            "silence from voice. Keep conditions realistic — AC hum, background "
+            "music, and crowd noise all count.<br><br>Ready?",
             QMessageBox.Yes | QMessageBox.Cancel,
             QMessageBox.Yes,
         )
         if proceed != QMessageBox.Yes:
             return
+        cal.start_noise_phase()
+        self._cal_run_progress(cal, "Measuring Noise Floor…", self._cal_noise_done_standalone)
 
-        calibrator.start_noise_phase()
-        self._cal_run_progress(calibrator, "Step 1 / 2 — Measuring Noise", self._cal_phase1_done)
-
-    def _cal_phase1_done(self, calibrator, cancelled):
+    def _cal_noise_done_standalone(self, cal, cancelled):
         if cancelled:
-            calibrator.cancel()
+            cal.cancel()
+            if hasattr(self, 'lbl_cal_status'):
+                self.lbl_cal_status.setText("Noise capture cancelled.")
             return
-        result = calibrator.compute_noise_result()
+        result = cal.compute_noise_result()
         if not result.get("ok"):
             retry = QMessageBox.question(
                 self.ui, "Noise Measurement Failed",
@@ -538,24 +572,58 @@ class TitanQtGUI(QObject):
                 QMessageBox.Retry,
             )
             if retry == QMessageBox.Retry:
-                self._cal_phase1(calibrator)
+                self._cal_start_noise_independent()
+            else:
+                if hasattr(self, 'lbl_cal_status'):
+                    self.lbl_cal_status.setText("Noise capture failed.")
             return
+        floor_db = result['noise_floor_db']
+        if hasattr(self, 'lbl_cal_status'):
+            self.lbl_cal_status.setText(
+                f"✅ Noise floor: {floor_db:.1f} dB  "
+                f"(±{result.get('noise_std', 0):.1f} dB)  — ready for voice capture"
+            )
+            self.lbl_cal_status.setStyleSheet("color: #00ff66; font-size: 11px;")
+
+    def _cal_start_voice_independent(self):
+        """Run only the voice phase. Uses stored noise result if available; warns otherwise."""
+        cal = self._cal_get_calibrator()
+        if cal is None:
+            return
+
+        if cal.noise_result and cal.noise_result.get("ok"):
+            floor_note = f"<b>Noise floor on file: {cal.noise_result['noise_floor_db']:.1f} dB.</b><br>"
+        else:
+            floor_note = (
+                "<b>No noise measurement on file.</b> A conservative default will be "
+                "used — run Measure Noise first for best accuracy.<br>"
+            )
 
         proceed = QMessageBox.question(
             self.ui,
-            "Step 2 / 2 — Measure Voice",
-            f"<b>Noise floor detected: {result['noise_floor_db']:.1f} dB.</b><br><br>"
-            f"Now have the actor speak at performance volume for "
-            f"{calibrator.voice_duration:.0f} seconds — normal lines, not "
-            f"a monotone hum. Keep talking the whole time.<br><br>Ready?",
+            "Measure Voice",
+            f"{floor_note}<br>"
+            f"Have the actor speak at performance volume for {cal.voice_duration:.0f} s — "
+            "normal lines, full energy. Keep talking the whole time.<br><br>Ready?",
             QMessageBox.Yes | QMessageBox.Cancel,
             QMessageBox.Yes,
         )
         if proceed != QMessageBox.Yes:
             return
 
-        calibrator.start_voice_phase()
-        self._cal_run_progress(calibrator, "Step 2 / 2 — Measuring Voice", self._cal_phase2_done)
+        # If no noise result, inject a conservative default so compute_voice_result works.
+        if not cal.noise_result or not cal.noise_result.get("ok"):
+            cal.noise_result = {
+                "ok": True,
+                "noise_floor_db": 40.0,   # conservative quiet room on Pd's rmstodb scale
+                "noise_std": 2.0,
+                "bass_prominence": 5.0,
+                "suggested_hip": 150.0,
+                "n_samples": 0,
+            }
+
+        cal.start_voice_phase()
+        self._cal_run_progress(cal, "Measuring Voice…", self._cal_phase2_done)
 
     def _cal_phase2_done(self, calibrator, cancelled):
         if cancelled:
@@ -1735,6 +1803,20 @@ class TitanQtGUI(QObject):
         adv_l.addWidget(QLabel("Src:"), 1, 0)
         adv_l.addWidget(self.txt_sacn_src, 1, 1, 1, 3)
 
+        # Control Universe — move from the Remote Control tab to here so all
+        # network configuration lives in one place. We redirect self.ui.spin_ctrl_univ
+        # to this new widget so _link_widgets wires it up automatically, then
+        # hide the original widget (and its label) that lives in the .ui file.
+        new_spin_ctrl_univ = QSpinBox()
+        new_spin_ctrl_univ.setRange(0, 15)
+        new_spin_ctrl_univ.setValue(int(self.params.get("ctrl_univ", 15)))
+        # Hide the originals from the Remote Control tab before redirecting.
+        for attr in ("spin_ctrl_univ", "label_22"):
+            orig = getattr(self.ui, attr, None)
+            if orig is not None:
+                orig.hide()
+        self.ui.spin_ctrl_univ = new_spin_ctrl_univ
+
         layout.addWidget(QLabel("Proto:"), 0, 0)
         layout.addWidget(self.cmb_protocol, 0, 1)
         layout.addWidget(QLabel("Mode:"), 0, 2)
@@ -1742,11 +1824,21 @@ class TitanQtGUI(QObject):
         layout.addWidget(self.chk_artnet_offset, 1, 0, 1, 2)
         layout.addWidget(QLabel("sACN Pri:"), 1, 2)
         layout.addWidget(self.spin_sacn_priority, 1, 3)
-        layout.addWidget(self.chk_adv_net, 2, 0, 1, 4)
-        layout.addWidget(self.frm_adv_net, 3, 0, 1, 4)
+        layout.addWidget(QLabel("Ctrl Universe:"), 2, 0)
+        layout.addWidget(new_spin_ctrl_univ, 2, 1)
+        layout.addWidget(self.chk_adv_net, 3, 0, 1, 4)
+        layout.addWidget(self.frm_adv_net, 4, 0, 1, 4)
 
         if self.ui.groupBox_6.layout():
             self.ui.groupBox_6.layout().addWidget(box)
+
+        # Rename the Output tab to "Network Config".
+        tabs = getattr(self.ui, 'settings_tabs', None)
+        if tabs:
+            for i in range(tabs.count()):
+                if "Output" in tabs.tabText(i):
+                    tabs.setTabText(i, tabs.tabText(i).replace("Output", "Network Config"))
+                    break
 
         self.chk_adv_net.toggled.connect(
             lambda v: (self.frm_adv_net.setVisible(v), self.params.update({"adv_net": int(v)})))

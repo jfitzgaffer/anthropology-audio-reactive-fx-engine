@@ -311,7 +311,9 @@ class AudioCalibrator:
             "lop": round(suggested_lop, 0),
             "expand": round(suggested_expand, 2),
             "knee": 0.05,
-            "env": 512.0,
+            # env (PD envelope window) is intentionally NOT touched: smaller
+            # values make PD send faster than DMX's 44 Hz ceiling, wasting CPU.
+            # Leave the user's current env setting alone.
             "drive": 1.0,
         }
 
